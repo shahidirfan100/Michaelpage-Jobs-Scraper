@@ -1,7 +1,7 @@
 // Michael Page jobs scraper - Optimized Hybrid Approach v3
 // Fast Playwright for listings, HTTP for details with proper field extraction
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, CheerioCrawler, Dataset, RequestQueue } from 'crawlee';
+import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
 await Actor.init();
@@ -52,7 +52,6 @@ async function main() {
 
         let saved = 0;
         const seenUrls = new Set();
-        const detailQueue = await RequestQueue.open('detail-queue');
 
         const cleanText = (html) => {
             if (!html) return '';
@@ -174,13 +173,10 @@ async function main() {
         log.info('Phase 2: Fetching details...');
 
         const urlsToFetch = jobUrls.slice(0, RESULTS_WANTED);
-        for (const jobUrl of urlsToFetch) {
-            await detailQueue.addRequest({ url: jobUrl });
-        }
+        log.info(`Queuing ${urlsToFetch.length} detail URLs`);
 
         const detailCrawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            requestQueue: detailQueue,
             maxRequestRetries: 3,
             maxConcurrency: 15,
             requestHandlerTimeoutSecs: 20,
@@ -373,7 +369,7 @@ async function main() {
             },
         });
 
-        await detailCrawler.run();
+        await detailCrawler.run(urlsToFetch);
         log.info(`Done. Saved ${saved} jobs.`);
 
     } catch (err) {
