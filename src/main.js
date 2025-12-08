@@ -59,10 +59,18 @@ async function main() {
         if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location));
 
+        log.info('Initial URLs to scrape:', { urls: initial });
+
         // Setup proxy configuration
-        const proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-            : await Actor.createProxyConfiguration({ useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] });
+        let proxyConf;
+        try {
+            proxyConf = proxyConfiguration
+                ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
+                : await Actor.createProxyConfiguration({ useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] });
+        } catch (err) {
+            log.warning(`Proxy config error: ${err.message}. Proceeding without proxy.`);
+            proxyConf = undefined;
+        }
 
         // Header generator for stealth
         const headerGenerator = new HeaderGenerator({
@@ -77,6 +85,8 @@ async function main() {
         // Extract JobPosting data from JSON-LD script tags
         function extractFromJsonLd($) {
             const scripts = $('script[type="application/ld+json"]');
+            log.debug(`Found ${scripts.length} JSON-LD scripts`);
+
             for (let i = 0; i < scripts.length; i++) {
                 try {
                     const text = $(scripts[i]).html();
@@ -88,6 +98,8 @@ async function main() {
                         if (!e) continue;
                         const t = e['@type'] || e.type;
                         if (t === 'JobPosting' || (Array.isArray(t) && t.includes('JobPosting'))) {
+                            log.debug('Found JobPosting JSON-LD');
+
                             // Extract salary robustly
                             let salary = null;
                             if (e.baseSalary) {
@@ -134,9 +146,19 @@ async function main() {
             return null;
         }
 
-        // Find all job detail links on a listing page - FIXED SELECTOR
+        // Find all job detail links on a listing page
         function findJobLinks($, base) {
             const links = new Set();
+
+            // Log page title for debugging
+            const pageTitle = $('title').text();
+            log.debug(`Page title: ${pageTitle}`);
+
+            // Check if we hit a cookie/consent page
+            const bodyText = $('body').text().toLowerCase();
+            if (bodyText.includes('cookie') && bodyText.includes('consent') && !bodyText.includes('job')) {
+                log.warning('Detected cookie consent page, content may be blocked');
+            }
 
             // Primary selector: any link containing /job-detail/
             $('a[href*="/job-detail/"]').each((_, a) => {
@@ -149,6 +171,24 @@ async function main() {
                     }
                 }
             });
+
+            log.debug(`Found ${links.size} job links with selector a[href*="/job-detail/"]`);
+
+            // Fallback: try other patterns if primary failed
+            if (links.size === 0) {
+                // Try finding any links that look like job URLs
+                $('a[href*="job"]').each((_, a) => {
+                    const href = $(a).attr('href');
+                    if (href && href.includes('/ref/') && !href.includes('javascript:')) {
+                        const abs = toAbs(href, base);
+                        if (abs && !seenUrls.has(abs)) {
+                            links.add(abs);
+                            seenUrls.add(abs);
+                        }
+                    }
+                });
+                log.debug(`Fallback found ${links.size} job links`);
+            }
 
             return [...links];
         }
@@ -186,11 +226,14 @@ async function main() {
                     'article.job-content',
                     '.job-description',
                     '[itemprop="description"]',
+                    'main article',
+                    'main .content',
                 ];
                 for (const sel of descSelectors) {
                     const content = $(sel).html();
                     if (content) {
                         descParts.push(cleanText(content));
+                        break; // Take first matching
                     }
                 }
             }
@@ -200,11 +243,7 @@ async function main() {
             // Location - try multiple sources
             data.location = $('meta[itemprop="addressLocality"]').attr('content') ||
                 $('div.job-location').text().trim() ||
-                $('.location').text().trim() ||
-                $('a[href*="/jobs/"][href*="-"]').filter((_, el) => {
-                    const text = $(el).text().trim().toLowerCase();
-                    return text.includes('york') || text.includes('london') || text.includes('city');
-                }).first().text().trim() || null;
+                $('.location').text().trim() || null;
 
             // Salary
             data.salary = $('meta[itemprop="baseSalary"]').attr('content') ||
@@ -214,8 +253,8 @@ async function main() {
             // Job type
             data.job_type = $('meta[itemprop="employmentType"]').attr('content') ||
                 $('div.job-contract-type').text().trim() ||
-                $('a[href*="contract=permanent"]').length ? 'Permanent' :
-                $('a[href*="contract=contract"]').length ? 'Contract' : null;
+                ($('a[href*="contract=permanent"]').length ? 'Permanent' :
+                    ($('a[href*="contract=contract"]').length ? 'Contract' : null));
 
             // Date posted
             data.date_posted = $('meta[itemprop="datePosted"]').attr('content') ||
@@ -228,6 +267,7 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 5,
             useSessionPool: true,
+            persistCookiesPerSession: true, // Important: persist cookies
             sessionPoolOptions: {
                 maxPoolSize: 20,
                 sessionOptions: {
@@ -239,34 +279,60 @@ async function main() {
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 45,
 
+            // Add cookies for consent
+            additionalMimeTypes: ['application/json'],
+
             preNavigationHooks: [
-                ({ request }) => {
+                ({ request, session }) => {
                     const headers = headerGenerator.getHeaders();
                     request.headers = {
                         ...request.headers,
                         ...headers,
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
                         'Cache-Control': 'no-cache',
                         'Pragma': 'no-cache',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1',
+                        // Cookie consent - accept all cookies
+                        'Cookie': 'CookieConsent=true; OptanonAlertBoxClosed=true; OptanonConsent=true',
                     };
+                    log.debug(`Request to ${request.url} with session ${session?.id || 'no-session'}`);
                 },
             ],
 
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, response }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 0;
+
+                // Log response status for debugging
+                crawlerLog.info(`[${label}] Response ${response?.statusCode || 'unknown'} from ${request.url}`);
 
                 try {
                     if (label === 'LIST') {
                         const links = findJobLinks($, request.url);
-                        crawlerLog.info(`[LIST] Page ${pageNo}: ${request.url} → found ${links.length} new job links`);
+                        crawlerLog.info(`[LIST] Page ${pageNo}: found ${links.length} new job links`);
 
-                        if (links.length === 0 && pageNo === 0) {
-                            crawlerLog.warning('No job links found on first page. Check if site structure changed.');
+                        // Debug: log first few links
+                        if (links.length > 0) {
+                            crawlerLog.debug(`First 3 links: ${links.slice(0, 3).join(', ')}`);
                         }
 
-                        if (collectDetails) {
+                        if (links.length === 0) {
+                            // Log HTML snippet for debugging
+                            const htmlSnippet = $.html().substring(0, 1500);
+                            crawlerLog.debug(`Page HTML snippet: ${htmlSnippet}`);
+
+                            if (pageNo === 0) {
+                                crawlerLog.warning('No job links found on first page. Site may be blocking or structure changed.');
+                            }
+                        }
+
+                        if (collectDetails && links.length > 0) {
                             const remaining = RESULTS_WANTED - saved;
                             const toEnqueue = links.slice(0, Math.max(0, remaining));
                             if (toEnqueue.length) {
@@ -274,8 +340,9 @@ async function main() {
                                     urls: toEnqueue,
                                     userData: { label: 'DETAIL' },
                                 });
+                                crawlerLog.info(`Enqueued ${toEnqueue.length} detail pages`);
                             }
-                        } else {
+                        } else if (!collectDetails && links.length > 0) {
                             // If not collecting details, save basic info from listing
                             const remaining = RESULTS_WANTED - saved;
                             const toPush = links.slice(0, Math.max(0, remaining));
@@ -285,6 +352,7 @@ async function main() {
                                     scrapedAt: new Date().toISOString(),
                                 })));
                                 saved += toPush.length;
+                                crawlerLog.info(`Saved ${toPush.length} URLs (no details mode)`);
                             }
                         }
 
@@ -355,6 +423,10 @@ async function main() {
         })));
 
         log.info(`Scraping complete. Total jobs saved: ${saved}`);
+
+        if (saved === 0) {
+            log.warning('No jobs were saved. Possible causes: site blocking, changed structure, or no jobs matching search.');
+        }
     } finally {
         await Actor.exit();
     }
