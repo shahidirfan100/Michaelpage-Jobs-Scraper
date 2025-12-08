@@ -1,0 +1,69 @@
+{
+  "title": "Michael Page Jobs Scraper",
+  "description": "Scrape job listings from Michael Page. Provide keyword and location to search for jobs. The actor handles pagination and can optionally fetch detailed job descriptions.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific Michael Page search URL. If provided, this overrides keyword and location.",
+      "editor": "textfield"
+    },
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Job search keyword(s), e.g., 'Software Engineer', 'Project Manager', 'Data Analyst'.",
+      "editor": "textfield",
+      "prefill": "project manager"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Location filter for Michael Page jobs, e.g., 'New York', 'London'.",
+      "editor": "textfield"
+    },
+    "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "If enabled, scraper opens job detail pages for full description.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum number of jobs",
+      "type": "integer",
+      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "A safety cap on the number of search result pages to visit.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 20
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy for reliable scraping.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    },
+    "dedupe": {
+      "title": "Deduplicate results",
+      "type": "boolean",
+      "description": "Remove duplicate job URLs from results (in-memory deduplication).",
+      "editor": "checkbox",
+      "default": true
+  }
+},
+  "required": [],
+  "additionalProperties": false
+}
