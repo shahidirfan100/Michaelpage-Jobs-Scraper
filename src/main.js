@@ -1,7 +1,7 @@
-// Michael Page jobs scraper - Playwright with GraphQL API interception
-// Priority: 1) Intercept GraphQL API calls, 2) Extract from page HTML
+// Michael Page jobs scraper - Playwright with full stealth and API interception
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { load as cheerioLoad } from 'cheerio';
 
 await Actor.init();
 
@@ -23,7 +23,7 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
 
-        log.info('Starting Michael Page Playwright scraper', { keyword, location, RESULTS_WANTED, MAX_PAGES, collectDetails });
+        log.info('Starting Michael Page scraper', { keyword, location, RESULTS_WANTED, MAX_PAGES, collectDetails });
 
         // Build search URL
         const buildStartUrl = (kw, loc) => {
@@ -40,43 +40,59 @@ async function main() {
         if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location));
 
-        log.info('Initial URLs:', { urls: initial });
+        log.info('Starting crawl', { urls: initial });
 
-        // Setup proxy configuration
+        // Setup proxy
         let proxyConf;
         try {
             proxyConf = proxyConfiguration
                 ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
                 : await Actor.createProxyConfiguration({ useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] });
+            log.info('Proxy configured successfully');
         } catch (err) {
-            log.warning(`Proxy config error: ${err.message}. Proceeding without proxy.`);
+            log.warning(`Proxy error: ${err.message}. Running without proxy.`);
             proxyConf = undefined;
         }
 
         let saved = 0;
         const seenUrls = new Set();
-        const graphqlJobs = []; // Store jobs from GraphQL responses
+        const capturedJobs = [];
 
-        // Clean HTML to plain text
+        // Clean text
         const cleanText = (html) => {
             if (!html) return '';
-            return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+            try {
+                const $ = cheerioLoad(html);
+                $('script, style').remove();
+                return $.text().replace(/\s+/g, ' ').trim();
+            } catch {
+                return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+            }
         };
 
         const crawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
+            persistCookiesPerSession: true,
             sessionPoolOptions: {
-                maxPoolSize: 10,
-                sessionOptions: { maxUsageCount: 30 },
+                maxPoolSize: 5,
             },
-            maxConcurrency: 2,
-            minConcurrency: 1,
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 60,
+            maxConcurrency: 1, // Low for stealth
+            requestHandlerTimeoutSecs: 180,
+            navigationTimeoutSecs: 90,
 
-            // Browser launch options for stealth
+            browserPoolOptions: {
+                useFingerprints: true,
+                fingerprintOptions: {
+                    fingerprintGeneratorOptions: {
+                        browsers: ['chrome'],
+                        devices: ['desktop'],
+                        operatingSystems: ['windows'],
+                    },
+                },
+            },
+
             launchContext: {
                 launchOptions: {
                     headless: true,
@@ -84,107 +100,150 @@ async function main() {
                         '--disable-blink-features=AutomationControlled',
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process',
                     ],
                 },
             },
 
-            // Setup request interception for GraphQL
-            async preNavigationHooks({ page, request, log: crawlerLog }) {
-                // Set realistic viewport
-                await page.setViewportSize({ width: 1920, height: 1080 });
+            async preNavigationHooks({ page, request }) {
+                // Remove webdriver property
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    // Override permissions
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) =>
+                        parameters.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : originalQuery(parameters);
+                });
 
-                // Intercept GraphQL API responses
+                // Set real user agent
+                await page.setExtraHTTPHeaders({
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Upgrade-Insecure-Requests': '1',
+                });
+
+                // Intercept responses to capture GraphQL/API data
                 page.on('response', async (response) => {
                     const url = response.url();
-                    if (url.includes('/graphql')) {
+                    const status = response.status();
+
+                    if (url.includes('graphql') || url.includes('/api/') || url.includes('jobs')) {
                         try {
-                            const json = await response.json();
-                            crawlerLog.debug(`GraphQL response captured from ${url}`);
-
-                            // Try to extract job data from various GraphQL response structures
-                            const extractJobs = (obj, path = '') => {
-                                if (!obj || typeof obj !== 'object') return;
-
-                                // Look for job-like objects
-                                if (obj.title && (obj.url || obj.slug || obj.id)) {
-                                    graphqlJobs.push({
-                                        title: obj.title,
-                                        company: obj.company?.name || obj.hiringOrganization?.name || null,
-                                        location: obj.location?.name || obj.location || obj.city || null,
-                                        salary: obj.salary || obj.compensation || null,
-                                        job_type: obj.employmentType || obj.type || obj.contractType || null,
-                                        date_posted: obj.datePosted || obj.createdAt || obj.publishedAt || null,
-                                        description_text: obj.description || obj.summary || null,
-                                        url: obj.url || (obj.slug ? `https://www.michaelpage.com/job-detail/${obj.slug}` : null),
-                                    });
+                            const contentType = response.headers()['content-type'] || '';
+                            if (contentType.includes('application/json') && status === 200) {
+                                const json = await response.json().catch(() => null);
+                                if (json) {
+                                    log.debug(`Captured JSON from: ${url}`);
+                                    extractJobsFromJson(json);
                                 }
-
-                                // Recurse into arrays and objects
-                                if (Array.isArray(obj)) {
-                                    obj.forEach((item, i) => extractJobs(item, `${path}[${i}]`));
-                                } else {
-                                    Object.keys(obj).forEach(key => {
-                                        if (key === 'jobs' || key === 'items' || key === 'results' || key === 'nodes' || key === 'edges') {
-                                            extractJobs(obj[key], `${path}.${key}`);
-                                        } else if (typeof obj[key] === 'object') {
-                                            extractJobs(obj[key], `${path}.${key}`);
-                                        }
-                                    });
-                                }
-                            };
-
-                            extractJobs(json);
-                            if (graphqlJobs.length > 0) {
-                                crawlerLog.info(`Extracted ${graphqlJobs.length} jobs from GraphQL so far`);
                             }
-                        } catch (err) {
-                            crawlerLog.debug(`Failed to parse GraphQL response: ${err.message}`);
+                        } catch (e) {
+                            // Ignore
                         }
                     }
                 });
 
-                // Accept cookies automatically
-                page.on('dialog', async (dialog) => {
-                    await dialog.accept();
-                });
+                // Function to extract jobs from any JSON structure
+                function extractJobsFromJson(obj, depth = 0) {
+                    if (!obj || depth > 10) return;
+
+                    if (Array.isArray(obj)) {
+                        obj.forEach(item => extractJobsFromJson(item, depth + 1));
+                        return;
+                    }
+
+                    if (typeof obj === 'object') {
+                        // Check if this looks like a job object
+                        if (obj.title && typeof obj.title === 'string' && obj.title.length > 0) {
+                            const jobUrl = obj.url || obj.link || obj.href ||
+                                (obj.slug ? `https://www.michaelpage.com/job-detail/${obj.slug}` : null) ||
+                                (obj.id ? `https://www.michaelpage.com/job-detail/${obj.id}` : null);
+
+                            if (jobUrl && !capturedJobs.find(j => j.url === jobUrl)) {
+                                capturedJobs.push({
+                                    title: obj.title || obj.name,
+                                    company: obj.company?.name || obj.hiringOrganization?.name || obj.employer || null,
+                                    location: obj.location?.name || obj.location?.city ||
+                                        (typeof obj.location === 'string' ? obj.location : null) ||
+                                        obj.city || obj.region || null,
+                                    salary: obj.salary || obj.compensation || obj.pay || null,
+                                    job_type: obj.employmentType || obj.type || obj.contractType || null,
+                                    date_posted: obj.datePosted || obj.postedAt || obj.createdAt || null,
+                                    description_text: obj.description || obj.summary || obj.content || null,
+                                    url: jobUrl,
+                                });
+                                log.debug(`Captured job from API: ${obj.title}`);
+                            }
+                        }
+
+                        // Recurse into object properties
+                        Object.values(obj).forEach(val => extractJobsFromJson(val, depth + 1));
+                    }
+                }
+
+                log.debug(`Navigating to: ${request.url}`);
             },
 
             async requestHandler({ request, page, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 0;
 
-                crawlerLog.info(`[${label}] Processing: ${request.url}`);
+                crawlerLog.info(`[${label}] Loading: ${request.url}`);
 
                 try {
-                    // Wait for page to load
-                    await page.waitForLoadState('domcontentloaded');
+                    // Wait for page load
+                    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+                    crawlerLog.info('Page DOM loaded');
 
-                    // Try to close cookie consent if present
+                    // Handle cookie consent
                     try {
-                        const cookieBtn = page.locator('button:has-text("Accept"), button:has-text("OK"), button:has-text("Agree"), [id*="cookie"] button, [class*="cookie"] button');
-                        if (await cookieBtn.first().isVisible({ timeout: 3000 })) {
-                            await cookieBtn.first().click();
-                            crawlerLog.info('Clicked cookie consent button');
-                            await page.waitForTimeout(1000);
+                        const cookieSelectors = [
+                            'button:has-text("Accept")',
+                            'button:has-text("Accept All")',
+                            'button:has-text("OK")',
+                            'button:has-text("I Agree")',
+                            '[id*="cookie"] button',
+                            '[class*="cookie"] button',
+                            '[id*="consent"] button',
+                            '.cookie-banner button',
+                        ];
+
+                        for (const sel of cookieSelectors) {
+                            const btn = page.locator(sel).first();
+                            if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+                                await btn.click().catch(() => { });
+                                crawlerLog.info('Clicked cookie consent');
+                                break;
+                            }
                         }
                     } catch {
-                        // Cookie button not found, continue
+                        // No cookie banner
                     }
 
-                    // Wait for content to load
-                    await page.waitForTimeout(2000);
-                    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => { });
+                    // Wait for network to settle
+                    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => { });
+
+                    // Extra wait for dynamic content
+                    await page.waitForTimeout(3000);
+
+                    // Get page content
+                    const content = await page.content();
+                    const $ = cheerioLoad(content);
 
                     if (label === 'LIST') {
-                        // First check if we got jobs from GraphQL interception
-                        if (graphqlJobs.length > 0) {
-                            crawlerLog.info(`Found ${graphqlJobs.length} jobs from GraphQL API`);
+                        // Check if we captured any jobs from API
+                        if (capturedJobs.length > 0) {
+                            crawlerLog.info(`Captured ${capturedJobs.length} jobs from API responses`);
 
-                            for (const job of graphqlJobs) {
+                            for (const job of capturedJobs) {
                                 if (saved >= RESULTS_WANTED) break;
-                                if (job.url && seenUrls.has(job.url)) continue;
-                                if (job.url) seenUrls.add(job.url);
+                                if (seenUrls.has(job.url)) continue;
+                                seenUrls.add(job.url);
 
                                 await Dataset.pushData({
                                     ...job,
@@ -192,210 +251,226 @@ async function main() {
                                 });
                                 saved++;
                             }
-                            graphqlJobs.length = 0; // Clear processed jobs
+                            capturedJobs.length = 0;
+                        }
 
-                            if (saved >= RESULTS_WANTED) {
-                                crawlerLog.info(`Reached target of ${RESULTS_WANTED} jobs`);
-                                return;
+                        // Find job links from HTML
+                        const jobLinks = [];
+                        $('a[href*="/job-detail/"]').each((_, el) => {
+                            const href = $(el).attr('href');
+                            if (href && !href.includes('javascript:')) {
+                                const fullUrl = href.startsWith('http') ? href : `https://www.michaelpage.com${href}`;
+                                if (!seenUrls.has(fullUrl)) {
+                                    jobLinks.push(fullUrl);
+                                    seenUrls.add(fullUrl);
+                                }
+                            }
+                        });
+
+                        crawlerLog.info(`Found ${jobLinks.length} job links from HTML`);
+
+                        // If no jobs found, try alternative selectors
+                        if (jobLinks.length === 0 && capturedJobs.length === 0) {
+                            // Check page title
+                            const title = await page.title();
+                            crawlerLog.warning(`No jobs found. Page title: ${title}`);
+
+                            // Log page HTML structure for debugging
+                            const bodyClasses = $('body').attr('class') || 'none';
+                            crawlerLog.debug(`Body classes: ${bodyClasses}`);
+
+                            // Try to find any job-like links
+                            $('a').each((_, el) => {
+                                const href = $(el).attr('href') || '';
+                                const text = $(el).text().trim();
+                                if ((href.includes('job') || href.includes('career')) &&
+                                    text.length > 5 && text.length < 200 &&
+                                    !href.includes('javascript:')) {
+                                    const fullUrl = href.startsWith('http') ? href : `https://www.michaelpage.com${href}`;
+                                    if (!seenUrls.has(fullUrl) && fullUrl.includes('michaelpage.com')) {
+                                        jobLinks.push(fullUrl);
+                                        seenUrls.add(fullUrl);
+                                    }
+                                }
+                            });
+
+                            if (jobLinks.length > 0) {
+                                crawlerLog.info(`Fallback found ${jobLinks.length} potential job links`);
+                            }
+
+                            // Take debug screenshot
+                            if (pageNo === 0) {
+                                const screenshot = await page.screenshot({ type: 'png', fullPage: false });
+                                await Actor.setValue('debug-screenshot', screenshot, { contentType: 'image/png' });
+                                crawlerLog.info('Saved debug screenshot');
                             }
                         }
 
-                        // Fallback: Find job links from HTML
-                        const jobLinks = await page.$$eval('a[href*="/job-detail/"]', (links) => {
-                            return links
-                                .map(a => a.href)
-                                .filter(href => href && !href.includes('javascript:'));
-                        });
-
-                        const uniqueLinks = jobLinks.filter(link => {
-                            if (seenUrls.has(link)) return false;
-                            seenUrls.add(link);
-                            return true;
-                        });
-
-                        crawlerLog.info(`[LIST] Page ${pageNo}: Found ${uniqueLinks.length} new job links from HTML`);
-
-                        if (uniqueLinks.length === 0 && graphqlJobs.length === 0 && pageNo === 0) {
-                            // Debug: log page title and content snippet
-                            const pageTitle = await page.title();
-                            crawlerLog.warning(`No jobs found on first page. Title: ${pageTitle}`);
-
-                            // Take screenshot for debugging
-                            const screenshot = await page.screenshot({ type: 'png' });
-                            await Actor.setValue('debug-screenshot', screenshot, { contentType: 'image/png' });
-                            crawlerLog.info('Saved debug screenshot to key-value store');
-                        }
-
-                        if (collectDetails && uniqueLinks.length > 0) {
+                        // Enqueue detail pages
+                        if (collectDetails && jobLinks.length > 0) {
                             const remaining = RESULTS_WANTED - saved;
-                            const toEnqueue = uniqueLinks.slice(0, Math.max(0, remaining));
-                            if (toEnqueue.length) {
-                                await enqueueLinks({
-                                    urls: toEnqueue,
+                            const toEnqueue = jobLinks.slice(0, Math.min(remaining, 50));
+
+                            for (const jobUrl of toEnqueue) {
+                                await crawler.addRequests([{
+                                    url: jobUrl,
                                     userData: { label: 'DETAIL' },
-                                });
-                                crawlerLog.info(`Enqueued ${toEnqueue.length} detail pages`);
+                                }]);
                             }
-                        } else if (!collectDetails && uniqueLinks.length > 0) {
+                            crawlerLog.info(`Enqueued ${toEnqueue.length} detail pages`);
+                        } else if (!collectDetails && jobLinks.length > 0) {
                             const remaining = RESULTS_WANTED - saved;
-                            const toPush = uniqueLinks.slice(0, Math.max(0, remaining));
+                            const toPush = jobLinks.slice(0, remaining);
                             await Dataset.pushData(toPush.map(u => ({
                                 url: u,
                                 scrapedAt: new Date().toISOString(),
                             })));
                             saved += toPush.length;
+                            crawlerLog.info(`Saved ${toPush.length} URLs`);
                         }
 
                         // Pagination
-                        if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && uniqueLinks.length > 0) {
+                        if (saved < RESULTS_WANTED && pageNo < MAX_PAGES - 1 && jobLinks.length > 0) {
                             const nextPageNo = pageNo + 1;
                             const nextUrl = new URL(request.url);
                             nextUrl.searchParams.set('page', String(nextPageNo));
 
-                            await enqueueLinks({
-                                urls: [nextUrl.href],
+                            await crawler.addRequests([{
+                                url: nextUrl.href,
                                 userData: { label: 'LIST', pageNo: nextPageNo },
-                            });
-                            crawlerLog.info(`Enqueued page ${nextPageNo}`);
+                            }]);
+                            crawlerLog.info(`Enqueued page ${nextPageNo + 1}`);
                         }
-                        return;
                     }
 
                     if (label === 'DETAIL') {
-                        if (saved >= RESULTS_WANTED) {
-                            crawlerLog.info('Already reached target. Skipping.');
-                            return;
-                        }
+                        if (saved >= RESULTS_WANTED) return;
 
-                        // Extract JSON-LD from script tag
-                        let jsonLdData = null;
-                        try {
-                            const jsonLdScript = await page.$eval('script[type="application/ld+json"]', el => el.textContent);
-                            if (jsonLdScript) {
-                                const parsed = JSON.parse(jsonLdScript);
-                                const arr = Array.isArray(parsed) ? parsed : [parsed];
-                                for (const item of arr) {
-                                    if (item?.['@type'] === 'JobPosting' ||
-                                        (Array.isArray(item?.['@type']) && item['@type'].includes('JobPosting'))) {
-                                        jsonLdData = item;
-                                        break;
+                        // Extract JSON-LD
+                        let jsonLd = null;
+                        $('script[type="application/ld+json"]').each((_, el) => {
+                            try {
+                                const text = $(el).html();
+                                if (text) {
+                                    const parsed = JSON.parse(text);
+                                    const items = Array.isArray(parsed) ? parsed : [parsed];
+                                    for (const item of items) {
+                                        if (item?.['@type'] === 'JobPosting') {
+                                            jsonLd = item;
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                        } catch {
-                            crawlerLog.debug('No JSON-LD found');
-                        }
+                            } catch { }
+                        });
 
-                        // Extract from HTML as fallback
-                        const title = jsonLdData?.title || jsonLdData?.name ||
-                            await page.$eval('h1', el => el.textContent?.trim()).catch(() => null) ||
-                            await page.title().then(t => t.split('|')[0]?.trim());
+                        // Extract from HTML
+                        const title = jsonLd?.title || jsonLd?.name ||
+                            $('h1').first().text().trim() ||
+                            $('title').text().split('|')[0]?.trim();
 
-                        // Get description from page sections
-                        let description = jsonLdData?.description || '';
+                        // Get description
+                        let description = jsonLd?.description || '';
                         if (!description) {
-                            const sections = await page.$$eval('h2', (headings) => {
-                                return headings.map(h2 => {
-                                    const text = h2.textContent?.toLowerCase() || '';
-                                    if (text.includes('about') || text.includes('description') ||
-                                        text.includes('applicant') || text.includes('offer')) {
-                                        let content = '';
-                                        let sibling = h2.nextElementSibling;
-                                        while (sibling && sibling.tagName !== 'H2') {
-                                            content += sibling.textContent + ' ';
-                                            sibling = sibling.nextElementSibling;
-                                        }
-                                        return content.trim();
-                                    }
-                                    return '';
-                                }).filter(Boolean);
+                            const parts = [];
+                            $('h2').each((_, h2) => {
+                                const heading = $(h2).text().toLowerCase();
+                                if (heading.includes('about') || heading.includes('description') ||
+                                    heading.includes('applicant') || heading.includes('offer')) {
+                                    let text = '';
+                                    $(h2).nextUntil('h2').each((_, sibling) => {
+                                        text += $(sibling).text() + ' ';
+                                    });
+                                    if (text.trim()) parts.push(text.trim());
+                                }
                             });
-                            description = sections.join('\n\n');
+                            description = parts.join('\n\n') || $('article, main, .content').text().trim().substring(0, 2000);
                         }
 
                         // Extract location
-                        let location = null;
-                        if (jsonLdData?.jobLocation) {
-                            const loc = Array.isArray(jsonLdData.jobLocation) ? jsonLdData.jobLocation[0] : jsonLdData.jobLocation;
+                        let jobLocation = null;
+                        if (jsonLd?.jobLocation) {
+                            const loc = Array.isArray(jsonLd.jobLocation) ? jsonLd.jobLocation[0] : jsonLd.jobLocation;
                             if (loc?.address) {
-                                location = [loc.address.addressLocality, loc.address.addressRegion]
+                                jobLocation = [loc.address.addressLocality, loc.address.addressRegion]
                                     .filter(Boolean).join(', ');
                             }
                         }
-                        if (!location) {
-                            location = await page.$eval('div.job-location, .location', el => el.textContent?.trim()).catch(() => null);
+                        if (!jobLocation) {
+                            jobLocation = $('.job-location, .location, [itemprop="jobLocation"]').first().text().trim() || null;
                         }
 
                         // Extract salary
                         let salary = null;
-                        if (jsonLdData?.baseSalary) {
-                            const bs = jsonLdData.baseSalary;
-                            if (typeof bs === 'string') {
-                                salary = bs;
-                            } else if (bs?.value) {
+                        if (jsonLd?.baseSalary) {
+                            const bs = jsonLd.baseSalary;
+                            if (typeof bs === 'string') salary = bs;
+                            else if (bs?.value) {
                                 const val = bs.value;
                                 if (typeof val === 'object') {
                                     salary = `${val.minValue || ''} - ${val.maxValue || ''} ${bs.currency || ''}`.trim();
                                 } else {
-                                    salary = `${val} ${bs.currency || ''}`.trim();
+                                    salary = `${val} ${bs.currency || ''}`;
                                 }
                             }
                         }
                         if (!salary) {
-                            salary = await page.$eval('div.job-salary, .salary', el => el.textContent?.trim()).catch(() => null);
+                            salary = $('.job-salary, .salary').first().text().trim() || null;
                         }
-
-                        const job_type = jsonLdData?.employmentType ||
-                            await page.$eval('div.job-contract-type', el => el.textContent?.trim()).catch(() => null);
 
                         const data = {
                             title: title || null,
-                            company: jsonLdData?.hiringOrganization?.name || null,
-                            location: location || null,
-                            salary: salary || null,
-                            job_type: Array.isArray(job_type) ? job_type.join(', ') : job_type || null,
-                            date_posted: jsonLdData?.datePosted || null,
-                            description_html: description || null,
-                            description_text: cleanText(description || ''),
+                            company: jsonLd?.hiringOrganization?.name || null,
+                            location: jobLocation,
+                            salary: salary,
+                            job_type: jsonLd?.employmentType ||
+                                (Array.isArray(jsonLd?.employmentType) ? jsonLd.employmentType.join(', ') : null),
+                            date_posted: jsonLd?.datePosted || null,
+                            description_html: description,
+                            description_text: cleanText(description),
                             url: request.url,
                             scrapedAt: new Date().toISOString(),
                         };
 
                         if (!data.title) {
-                            crawlerLog.warning(`Skipping job with no title: ${request.url}`);
+                            crawlerLog.warning(`No title found: ${request.url}`);
                             return;
                         }
 
                         await Dataset.pushData(data);
                         saved++;
-                        crawlerLog.info(`[DETAIL] Saved job ${saved}/${RESULTS_WANTED}: ${data.title}`);
+                        crawlerLog.info(`[DETAIL] Saved ${saved}/${RESULTS_WANTED}: ${data.title}`);
                     }
+
                 } catch (err) {
-                    crawlerLog.error(`Handler error: ${err.message}`);
+                    crawlerLog.error(`Error: ${err.message}`, { stack: err.stack });
                 }
             },
 
-            failedRequestHandler({ request, log: crawlerLog }, error) {
-                crawlerLog.error(`Failed: ${request.url}`, { error: error.message });
+            async failedRequestHandler({ request }, error) {
+                log.error(`Failed: ${request.url}`, { error: error.message });
             },
         });
 
+        log.info('Starting crawler...');
         await crawler.run(initial.map(u => ({
             url: u,
             userData: { label: 'LIST', pageNo: 0 },
         })));
 
-        log.info(`Scraping complete. Total jobs saved: ${saved}`);
+        log.info(`Complete. Saved ${saved} jobs.`);
 
         if (saved === 0) {
-            log.warning('No jobs saved. Check debug-screenshot in key-value store for page state.');
+            log.warning('No jobs saved. Check debug-screenshot in key-value store.');
         }
+    } catch (err) {
+        log.error(`Fatal: ${err.message}`, { stack: err.stack });
     } finally {
         await Actor.exit();
     }
 }
 
 main().catch(err => {
-    console.error('Fatal error:', err);
+    console.error('Unhandled error:', err);
     process.exit(1);
 });
