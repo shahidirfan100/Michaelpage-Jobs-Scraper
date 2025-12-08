@@ -11,6 +11,9 @@
           "location",
           "salary",
           "job_type",
+          "job_nature",
+          "sector",
+          "industry",
           "date_posted",
           "url"
         ]
@@ -36,6 +39,18 @@
           },
           "job_type": {
             "label": "Job Type",
+            "format": "text"
+          },
+          "job_nature": {
+            "label": "Job Nature",
+            "format": "text"
+          },
+          "sector": {
+            "label": "Sector",
+            "format": "text"
+          },
+          "industry": {
+            "label": "Industry",
             "format": "text"
           },
           "date_posted": {

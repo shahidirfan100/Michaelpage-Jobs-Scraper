@@ -1,4 +1,4 @@
-// Michael Page jobs scraper - Optimized Hybrid Approach v2
+// Michael Page jobs scraper - Optimized Hybrid Approach v3
 // Fast Playwright for listings, HTTP for details with proper field extraction
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, CheerioCrawler, Dataset, RequestQueue } from 'crawlee';
@@ -54,10 +54,33 @@ async function main() {
         const seenUrls = new Set();
         const detailQueue = await RequestQueue.open('detail-queue');
 
-        // Clean text helper
         const cleanText = (html) => {
             if (!html) return '';
             return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        };
+
+        // Helper: Extract field value from summary detail section by label
+        const extractSummaryField = ($, labelText) => {
+            // Find dt containing the label and get adjacent dd value
+            let value = null;
+            $('dt').each((_, dt) => {
+                const label = $(dt).text().toLowerCase().trim();
+                if (label.includes(labelText.toLowerCase())) {
+                    value = $(dt).next('dd').text().trim() ||
+                        $(dt).next('dd.field--item').text().trim() ||
+                        $(dt).siblings('dd.field--item').first().text().trim();
+                }
+            });
+            // Also try the specific class structure
+            if (!value) {
+                $('dl').each((_, dl) => {
+                    const dt = $(dl).find('dt').text().toLowerCase().trim();
+                    if (dt.includes(labelText.toLowerCase())) {
+                        value = $(dl).find('dd.field--item, dd.summary-detail-field-value').text().trim();
+                    }
+                });
+            }
+            return value || null;
         };
 
         // ============================================================
@@ -85,11 +108,9 @@ async function main() {
 
             preNavigationHooks: [
                 async ({ page }) => {
-                    // Minimal stealth
                     await page.addInitScript(() => {
                         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                     });
-                    // Block images/fonts for speed
                     await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}', route => route.abort());
                 },
             ],
@@ -98,10 +119,8 @@ async function main() {
                 const pageNo = request.userData?.pageNo || 0;
                 crawlerLog.info(`[LIST] Page ${pageNo + 1}`);
 
-                // Fast load - just wait for DOM, not network idle
                 await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
 
-                // Quick cookie consent check (non-blocking)
                 try {
                     const cookieBtn = page.locator('button:has-text("Accept")').first();
                     if (await cookieBtn.isVisible({ timeout: 1500 })) {
@@ -109,10 +128,8 @@ async function main() {
                     }
                 } catch { }
 
-                // Brief wait for JS to render job links
                 await page.waitForTimeout(1500);
 
-                // Extract job links
                 const links = await page.$$eval('a[href*="/job-detail/"]', (anchors) =>
                     [...new Set(anchors.map(a => a.href).filter(h => h && !h.includes('javascript:')))]
                 );
@@ -126,7 +143,6 @@ async function main() {
                 jobUrls.push(...uniqueLinks);
                 crawlerLog.info(`Found ${uniqueLinks.length} links (total: ${jobUrls.length})`);
 
-                // Pagination
                 if (jobUrls.length < RESULTS_WANTED && pageNo < MAX_PAGES - 1 && uniqueLinks.length > 0) {
                     const nextUrl = new URL(request.url);
                     nextUrl.searchParams.set('page', String(pageNo + 1));
@@ -166,7 +182,7 @@ async function main() {
             proxyConfiguration: proxyConf,
             requestQueue: detailQueue,
             maxRequestRetries: 3,
-            maxConcurrency: 15, // High concurrency for speed
+            maxConcurrency: 15,
             requestHandlerTimeoutSecs: 20,
 
             async requestHandler({ request, $, log: crawlerLog }) {
@@ -198,17 +214,14 @@ async function main() {
                 // ====== Description HTML (with tags) ======
                 let descriptionHtml = '';
                 if (jsonLd?.description) {
-                    // JSON-LD description - may already have HTML or be plain text
                     descriptionHtml = jsonLd.description;
                 } else {
-                    // Extract from page sections with HTML preserved
                     const sections = [];
                     $('h2').each((_, h2) => {
                         const heading = $(h2).text().toLowerCase();
                         if (heading.includes('about') || heading.includes('description') ||
                             heading.includes('applicant') || heading.includes('offer') ||
                             heading.includes('job summary') || heading.includes('responsibilities')) {
-
                             let sectionHtml = '';
                             $(h2).nextUntil('h2').each((_, sib) => {
                                 sectionHtml += $.html(sib);
@@ -218,13 +231,9 @@ async function main() {
                             }
                         }
                     });
-
-                    if (sections.length > 0) {
-                        descriptionHtml = sections.join('');
-                    } else {
-                        // Fallback: get main content area
-                        descriptionHtml = $('article, main .content, .job-description, .job-content').first().html() || '';
-                    }
+                    descriptionHtml = sections.length > 0
+                        ? sections.join('')
+                        : $('article, main .content, .job-description, .job-content').first().html() || '';
                 }
 
                 // ====== Location ======
@@ -234,18 +243,12 @@ async function main() {
                     if (loc?.address) {
                         jobLocation = [loc.address.addressLocality, loc.address.addressRegion, loc.address.addressCountry]
                             .filter(Boolean).join(', ');
-                    } else if (typeof loc === 'string') {
-                        jobLocation = loc;
                     }
                 }
                 if (!jobLocation) {
-                    // Try various HTML selectors
-                    jobLocation = $('[itemprop="addressLocality"]').text().trim() ||
-                        $('.job-location').text().trim() ||
-                        $('a[href*="/jobs/"][href*="-"]').filter((_, el) => {
-                            const text = $(el).text().toLowerCase();
-                            return !text.includes('search') && text.length < 50;
-                        }).first().text().trim() || null;
+                    jobLocation = extractSummaryField($, 'location') ||
+                        $('[itemprop="addressLocality"]').text().trim() ||
+                        $('.job-location').text().trim() || null;
                 }
 
                 // ====== Salary ======
@@ -258,52 +261,54 @@ async function main() {
                         const val = bs.value;
                         const currency = bs.currency || '';
                         if (typeof val === 'object') {
-                            const min = val.minValue || val.value || '';
-                            const max = val.maxValue || '';
-                            salary = max ? `${currency} ${min} - ${max}`.trim() : `${currency} ${min}`.trim();
+                            salary = `${currency} ${val.minValue || ''} - ${val.maxValue || ''}`.trim();
                         } else {
                             salary = `${currency} ${val}`.trim();
                         }
                     }
                 }
                 if (!salary) {
-                    salary = $('[itemprop="baseSalary"]').text().trim() ||
-                        $('.job-salary, .salary').text().trim() ||
-                        $('dt:contains("Salary")').next('dd').text().trim() || null;
+                    salary = extractSummaryField($, 'salary') ||
+                        $('[itemprop="baseSalary"]').text().trim() ||
+                        $('.job-salary, .salary').text().trim() || null;
                 }
 
-                // ====== Job Type / Employment Type ======
+                // ====== Job Type / Contract Type ======
                 let jobType = null;
                 if (jsonLd?.employmentType) {
-                    jobType = Array.isArray(jsonLd.employmentType)
-                        ? jsonLd.employmentType.join(', ')
-                        : jsonLd.employmentType;
+                    jobType = Array.isArray(jsonLd.employmentType) ? jsonLd.employmentType.join(', ') : jsonLd.employmentType;
                 }
                 if (!jobType) {
-                    // Try HTML extraction
-                    jobType = $('[itemprop="employmentType"]').text().trim() ||
-                        $('.job-contract-type, .contract-type').text().trim() ||
-                        $('dt:contains("Contract")').next('dd').text().trim() ||
-                        $('dt:contains("Type")').next('dd').text().trim() ||
-                        $('a[href*="contract=permanent"]').length ? 'Permanent' :
-                        $('a[href*="contract=temporary"]').length ? 'Temporary' :
-                            $('a[href*="contract=contract"]').length ? 'Contract' : null;
+                    jobType = extractSummaryField($, 'contract') ||
+                        extractSummaryField($, 'job type') ||
+                        extractSummaryField($, 'employment') ||
+                        $('dd.field--item.summary-detail-field-value').filter((_, el) => {
+                            const prev = $(el).prev('dt').text().toLowerCase();
+                            return prev.includes('contract') || prev.includes('type');
+                        }).first().text().trim() ||
+                        $('[itemprop="employmentType"]').text().trim() ||
+                        $('.job-contract-type').text().trim() || null;
                 }
 
-                // ====== Date Posted ======
-                let datePosted = null;
-                if (jsonLd?.datePosted) {
-                    datePosted = jsonLd.datePosted;
-                }
-                if (!datePosted) {
-                    // Try HTML extraction
-                    datePosted = $('[itemprop="datePosted"]').attr('content') ||
-                        $('[itemprop="datePosted"]').text().trim() ||
-                        $('time[datetime]').attr('datetime') ||
-                        $('dt:contains("Posted")').next('dd').text().trim() ||
-                        $('dt:contains("Date")').next('dd').text().trim() ||
-                        $('.posted-date, .date-posted').text().trim() || null;
-                }
+                // ====== Sector ======
+                let sector = extractSummaryField($, 'sector') ||
+                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
+                        return $(el).prev('dt').text().toLowerCase().includes('sector');
+                    }).first().text().trim() || null;
+
+                // ====== Industry ======
+                let industry = extractSummaryField($, 'industry') ||
+                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
+                        return $(el).prev('dt').text().toLowerCase().includes('industry');
+                    }).first().text().trim() ||
+                    jsonLd?.industry || null;
+
+                // ====== Job Nature (Permanent/Contract/Temporary) ======
+                let jobNature = extractSummaryField($, 'job nature') ||
+                    extractSummaryField($, 'nature') ||
+                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
+                        return $(el).prev('dt').text().toLowerCase().includes('nature');
+                    }).first().text().trim() || null;
 
                 // ====== Company ======
                 let company = null;
@@ -313,8 +318,25 @@ async function main() {
                         : jsonLd.hiringOrganization.name;
                 }
                 if (!company) {
-                    company = $('[itemprop="hiringOrganization"] [itemprop="name"]').text().trim() ||
+                    company = extractSummaryField($, 'company') ||
+                        extractSummaryField($, 'employer') ||
+                        $('dd.field--item.summary-detail-field-value').filter((_, el) => {
+                            const prev = $(el).prev('dt').text().toLowerCase();
+                            return prev.includes('company') || prev.includes('employer');
+                        }).first().text().trim() ||
+                        $('[itemprop="hiringOrganization"] [itemprop="name"]').text().trim() ||
                         $('.company-name').text().trim() || null;
+                }
+
+                // ====== Date Posted ======
+                let datePosted = jsonLd?.datePosted || null;
+                if (!datePosted) {
+                    datePosted = extractSummaryField($, 'posted') ||
+                        extractSummaryField($, 'date') ||
+                        $('[itemprop="datePosted"]').attr('content') ||
+                        $('[itemprop="datePosted"]').text().trim() ||
+                        $('time[datetime]').attr('datetime') ||
+                        $('.posted-date, .date-posted').text().trim() || null;
                 }
 
                 const data = {
@@ -323,6 +345,9 @@ async function main() {
                     location: jobLocation,
                     salary: salary,
                     job_type: jobType,
+                    job_nature: jobNature,
+                    sector: sector,
+                    industry: industry,
                     date_posted: datePosted,
                     description_html: descriptionHtml || null,
                     description_text: cleanText(descriptionHtml),
