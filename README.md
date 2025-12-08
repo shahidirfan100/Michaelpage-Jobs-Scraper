@@ -1,94 +1,81 @@
 # Michael Page Jobs Scraper
 
-An Apify actor for extracting job listings from Michael Page's career portal. This scraper provides comprehensive job data extraction, supporting targeted searches by keywords and locations, with options for detailed descriptions and pagination handling.
+An Apify actor for extracting job listings from Michael Page's career portal. This production-ready scraper provides comprehensive job data extraction with stealth measures for reliable scraping.
 
 ## Features
 
-- **Complete Job Data Extraction**: Captures essential job information including titles, locations, salary ranges, employment types, and detailed descriptions.
-- **Advanced Search Capabilities**: Enables precise job searches using keywords and geographic filters for customized results.
-- **Multi-Page Scraping**: Seamlessly handles pagination to gather large volumes of job listings across multiple result pages.
-- **In-Depth Detail Mode**: Includes functionality to scrape full job descriptions and additional metadata from individual job pages.
-- **Clean Data Output**: Delivers structured JSON data, perfect for database integration, analytics, and reporting.
-- **Reliable Scraping Infrastructure**: Incorporates proxy support for consistent and efficient data collection.
+- **Smart Data Extraction**: Prioritizes JSON-LD structured data with HTML parsing fallback
+- **Advanced Search**: Filter jobs by keywords and locations
+- **Automatic Pagination**: Seamlessly handles multi-page results
+- **Stealth Mode**: Session management, proxy rotation, and realistic headers
+- **Production Ready**: Robust error handling and retry mechanisms
 
 ## Input
 
-The actor requires the following input parameters for operation:
-
-- `keyword` (string): Keywords for job search, such as "marketing manager" or "financial analyst".
-- `location` (string): Geographic filter, e.g., "Chicago" or "Los Angeles".
-- `results_wanted` (integer): Total jobs to collect, defaults to 100.
-- `max_pages` (integer): Maximum pages to scrape, defaults to 20.
-- `collectDetails` (boolean): Toggle for fetching detailed job descriptions, defaults to true.
-- `proxyConfiguration` (object): Proxy settings for optimal performance.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `keyword` | string | - | Job search keywords (e.g., "Project Manager") |
+| `location` | string | - | Location filter (e.g., "New York") |
+| `results_wanted` | integer | 100 | Maximum jobs to collect |
+| `max_pages` | integer | 20 | Maximum pages to scrape |
+| `collectDetails` | boolean | true | Fetch full job descriptions |
+| `startUrl` | string | - | Custom start URL (overrides filters) |
+| `proxyConfiguration` | object | Residential | Apify Proxy settings |
 
 ### Example Input
 
 ```json
 {
-  "keyword": "sales director",
-  "location": "Boston",
-  "results_wanted": 25,
+  "keyword": "software engineer",
+  "location": "New York",
+  "results_wanted": 50,
   "collectDetails": true
 }
 ```
 
 ## Output
 
-The actor generates a dataset with job records in JSON format, each containing:
+Each job record contains:
 
 ```json
 {
-  "title": "Sales Director",
+  "title": "Senior Software Engineer",
   "company": null,
-  "location": "Boston, MA",
-  "salary": "USD 120,000 - USD 150,000 per year",
+  "location": "New York, NY",
+  "salary": "$150,000 - $180,000",
   "job_type": "Permanent",
-  "date_posted": null,
-  "description_html": "<p>Detailed job description...</p>",
-  "description_text": "Plain text job description...",
-  "url": "https://www.michaelpage.com/job-detail/sales-director/..."
+  "date_posted": "2025-12-07",
+  "description_html": "<p>Full job description...</p>",
+  "description_text": "Plain text description...",
+  "url": "https://www.michaelpage.com/job-detail/...",
+  "scrapedAt": "2025-12-08T10:00:00.000Z"
 }
 ```
 
 ## Usage
 
-1. **Setup**: Configure input parameters in the Apify platform.
-2. **Execution**: Run the actor to initiate scraping.
-3. **Retrieval**: Download results as JSON or CSV from the dataset.
+1. Configure input parameters on the Apify platform
+2. Run the actor
+3. Download results as JSON, CSV, or Excel
 
-### Configuration
+### Tips
 
-- **Proxy Usage**: Recommended for large-scale scraping to ensure reliability.
-- **Limits**: Adjust `results_wanted` and `max_pages` based on needs.
-- **Detail Level**: Enable `collectDetails` for richer data.
+- Use **Residential proxies** for best results
+- Start with lower `results_wanted` to test
+- Enable `collectDetails` for full job descriptions
 
-## Cost
+## Cost Estimation
 
-- **Free Tier**: Suitable for small-scale extractions.
-- **Paid Usage**: Scales with compute and proxy requirements.
+- ~1-2 CU per 100 jobs with details
+- ~0.5 CU per 100 jobs without details
 
-## Limits
+## Technical Details
 
-- **Rate Limits**: Respects website policies; use proxies to manage.
-- **Data Volume**: No hard limits, but optimize for efficiency.
-
-## SEO Keywords
-
-- Michael Page jobs scraper
-- Job listings extractor
-- Recruitment data scraper
-- Employment opportunities crawler
-- Career site data mining
-- Job search automation
-- Professional job scraper
-- Job market data tool
-- Recruitment analytics scraper
-
-## Contributing
-
-Contributions welcome. Follow Apify guidelines for submissions.
+- **Runtime**: Node.js 22
+- **Framework**: Crawlee CheerioCrawler
+- **Proxy**: Apify Residential recommended
+- **Data Sources**: JSON-LD (primary), HTML (fallback)
 
 ## License
 
-Licensed under MIT. Use responsibly and comply with terms of service.
+MIT License - Use responsibly and comply with website terms of service.

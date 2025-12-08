@@ -1,16 +1,8 @@
-FROM alpine:latest
+FROM apify/actor-node:22
 
-RUN apk add --no-cache nodejs npm
+COPY --chown=myuser:myuser package*.json ./
+RUN npm i --omit=dev --omit=optional && rm -rf ~/.npm
 
-RUN addgroup app && adduser app -G app -D
-WORKDIR /home/app
-USER app
-
-COPY --chown=app:app package*.json ./
-RUN npm i --omit=dev && rm -r ~/.npm || true
-
-COPY --chown=app:app . ./
-
-ENV APIFY_LOG_LEVEL=ERROR
+COPY --chown=myuser:myuser . ./
 
 CMD npm start --silent

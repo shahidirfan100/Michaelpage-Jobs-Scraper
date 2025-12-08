@@ -49,21 +49,15 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Proxy for reliable scraping.",
+      "description": "Use Apify Proxy for reliable scraping. Residential proxies recommended.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
       }
-    },
-    "dedupe": {
-      "title": "Deduplicate results",
-      "type": "boolean",
-      "description": "Remove duplicate job URLs from results (in-memory deduplication).",
-      "editor": "checkbox",
-      "default": true
-  }
-},
-  "required": [],
-  "additionalProperties": false
+    }
+  },
+  "required": []
 }
