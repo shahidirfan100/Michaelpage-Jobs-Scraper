@@ -1,11 +1,94 @@
-// Michael Page jobs scraper - Optimized Hybrid Approach v3
-// Fast Playwright for listings, HTTP for details with proper field extraction
+/**
+ * Michael Page Jobs Scraper - Optimized Hybrid Approach v3
+ * Fast Playwright for listings, HTTP for details with proper field extraction
+ * 
+ * @description A production-ready Apify Actor that scrapes job listings from Michael Page.
+ * Uses a two-phase approach: Playwright for pagination-heavy listing pages,
+ * and CheerioCrawler for fast detail page extraction.
+ */
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
-import { load as cheerioLoad } from 'cheerio';
 
 await Actor.init();
 
+/**
+ * Strips HTML tags and normalizes whitespace from a string.
+ * @param {string} html - The HTML string to clean
+ * @returns {string} Plain text with normalized whitespace
+ */
+const cleanText = (html) => {
+    if (!html) return '';
+    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+};
+
+/**
+ * Extracts a field value from the job summary section by its label.
+ * Searches through dt/dd pairs in the DOM to find matching fields.
+ * @param {CheerioAPI} $ - Cheerio instance loaded with the page HTML
+ * @param {string} labelText - The label text to search for (case-insensitive)
+ * @returns {string|null} The extracted value or null if not found
+ */
+const extractSummaryField = ($, labelText) => {
+    const searchLabel = labelText.toLowerCase();
+    let value = null;
+
+    // Primary: Search dt elements for matching label
+    $('dt').each((_, dt) => {
+        const label = $(dt).text().toLowerCase().trim();
+        if (label.includes(searchLabel)) {
+            value = $(dt).next('dd').text().trim() ||
+                $(dt).next('dd.field--item').text().trim() ||
+                $(dt).siblings('dd.field--item').first().text().trim();
+        }
+    });
+
+    // Fallback: Search dl structure
+    if (!value) {
+        $('dl').each((_, dl) => {
+            const dt = $(dl).find('dt').text().toLowerCase().trim();
+            if (dt.includes(searchLabel)) {
+                value = $(dl).find('dd.field--item, dd.summary-detail-field-value').text().trim();
+            }
+        });
+    }
+
+    return value || null;
+};
+
+/**
+ * Extracts field value from dd elements by checking previous dt label.
+ * @param {CheerioAPI} $ - Cheerio instance
+ * @param {string} labelText - Label to match in previous dt element
+ * @returns {string|null} Extracted value or null
+ */
+const extractFieldByDtLabel = ($, labelText) => {
+    const searchLabel = labelText.toLowerCase();
+    const result = $('dd.field--item.summary-detail-field-value')
+        .filter((_, el) => $(el).prev('dt').text().toLowerCase().includes(searchLabel))
+        .first()
+        .text()
+        .trim();
+    return result || null;
+};
+
+/**
+ * Builds the Michael Page search URL with query parameters.
+ * @param {string} keyword - Job search keyword
+ * @param {string} location - Location filter
+ * @returns {string} Complete search URL
+ */
+const buildStartUrl = (keyword, location) => {
+    const url = new URL('https://www.michaelpage.com/jobs');
+    if (keyword) url.searchParams.set('search', String(keyword).trim());
+    if (location) url.searchParams.set('location', String(location).trim());
+    return url.href;
+};
+
+/**
+ * Main scraper entry point.
+ * Orchestrates the two-phase scraping process.
+ * @returns {Promise<void>}
+ */
 async function main() {
     try {
         const input = (await Actor.getInput()) || {};
@@ -21,30 +104,31 @@ async function main() {
             proxyConfiguration,
         } = input;
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
+            ? Math.max(1, +RESULTS_WANTED_RAW)
+            : Number.MAX_SAFE_INTEGER;
+        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
+            ? Math.max(1, +MAX_PAGES_RAW)
+            : 999;
 
         log.info('Starting Michael Page scraper', { keyword, location, RESULTS_WANTED, MAX_PAGES });
 
-        const buildStartUrl = (kw, loc) => {
-            const u = new URL('https://www.michaelpage.com/jobs');
-            if (kw) u.searchParams.set('search', String(kw).trim());
-            if (loc) u.searchParams.set('location', String(loc).trim());
-            return u.href;
-        };
-
+        // Build initial URLs from various input sources
         const initial = [];
         if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
         if (startUrl) initial.push(startUrl);
         if (url) initial.push(url);
         if (!initial.length) initial.push(buildStartUrl(keyword, location));
 
-        // Setup proxy
+        // Setup proxy configuration
         let proxyConf;
         try {
             proxyConf = proxyConfiguration
                 ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-                : await Actor.createProxyConfiguration({ useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] });
+                : await Actor.createProxyConfiguration({
+                    useApifyProxy: true,
+                    apifyProxyGroups: ['RESIDENTIAL']
+                });
         } catch (err) {
             log.warning(`Proxy error: ${err.message}`);
             proxyConf = undefined;
@@ -52,42 +136,12 @@ async function main() {
 
         let saved = 0;
         const seenUrls = new Set();
-
-        const cleanText = (html) => {
-            if (!html) return '';
-            return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        };
-
-        // Helper: Extract field value from summary detail section by label
-        const extractSummaryField = ($, labelText) => {
-            // Find dt containing the label and get adjacent dd value
-            let value = null;
-            $('dt').each((_, dt) => {
-                const label = $(dt).text().toLowerCase().trim();
-                if (label.includes(labelText.toLowerCase())) {
-                    value = $(dt).next('dd').text().trim() ||
-                        $(dt).next('dd.field--item').text().trim() ||
-                        $(dt).siblings('dd.field--item').first().text().trim();
-                }
-            });
-            // Also try the specific class structure
-            if (!value) {
-                $('dl').each((_, dl) => {
-                    const dt = $(dl).find('dt').text().toLowerCase().trim();
-                    if (dt.includes(labelText.toLowerCase())) {
-                        value = $(dl).find('dd.field--item, dd.summary-detail-field-value').text().trim();
-                    }
-                });
-            }
-            return value || null;
-        };
+        const jobUrls = [];
 
         // ============================================================
         // PHASE 1: Fast Playwright for listing pages only
         // ============================================================
         log.info('Phase 1: Collecting job URLs...');
-
-        const jobUrls = [];
 
         const listingCrawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
@@ -101,15 +155,21 @@ async function main() {
             launchContext: {
                 launchOptions: {
                     headless: true,
-                    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-gpu'],
+                    args: [
+                        '--disable-blink-features=AutomationControlled',
+                        '--no-sandbox',
+                        '--disable-gpu'
+                    ],
                 },
             },
 
             preNavigationHooks: [
                 async ({ page }) => {
+                    // Hide webdriver property to avoid detection
                     await page.addInitScript(() => {
                         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                     });
+                    // Block unnecessary resources for faster loading
                     await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}', route => route.abort());
                 },
             ],
@@ -120,15 +180,17 @@ async function main() {
 
                 await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
 
+                // Dismiss cookie consent if present
                 try {
                     const cookieBtn = page.locator('button:has-text("Accept")').first();
                     if (await cookieBtn.isVisible({ timeout: 1500 })) {
                         await cookieBtn.click();
                     }
-                } catch { }
+                } catch { /* Cookie button not found - continue */ }
 
                 await page.waitForTimeout(1500);
 
+                // Extract unique job detail links
                 const links = await page.$$eval('a[href*="/job-detail/"]', (anchors) =>
                     [...new Set(anchors.map(a => a.href).filter(h => h && !h.includes('javascript:')))]
                 );
@@ -142,10 +204,14 @@ async function main() {
                 jobUrls.push(...uniqueLinks);
                 crawlerLog.info(`Found ${uniqueLinks.length} links (total: ${jobUrls.length})`);
 
+                // Paginate if more results needed
                 if (jobUrls.length < RESULTS_WANTED && pageNo < MAX_PAGES - 1 && uniqueLinks.length > 0) {
                     const nextUrl = new URL(request.url);
                     nextUrl.searchParams.set('page', String(pageNo + 1));
-                    await listingCrawler.addRequests([{ url: nextUrl.href, userData: { pageNo: pageNo + 1 } }]);
+                    await listingCrawler.addRequests([{
+                        url: nextUrl.href,
+                        userData: { pageNo: pageNo + 1 }
+                    }]);
                 }
             },
         });
@@ -164,7 +230,10 @@ async function main() {
         // ============================================================
         if (!collectDetails) {
             const toSave = jobUrls.slice(0, RESULTS_WANTED);
-            await Dataset.pushData(toSave.map(u => ({ url: u, scrapedAt: new Date().toISOString() })));
+            await Dataset.pushData(toSave.map(u => ({
+                url: u,
+                scrapedAt: new Date().toISOString()
+            })));
             log.info(`Saved ${toSave.length} URLs`);
             await Actor.exit();
             return;
@@ -184,7 +253,7 @@ async function main() {
             async requestHandler({ request, $, log: crawlerLog }) {
                 if (saved >= RESULTS_WANTED) return;
 
-                // ====== Extract JSON-LD (primary source) ======
+                // Extract JSON-LD structured data (primary source)
                 let jsonLd = null;
                 $('script[type="application/ld+json"]').each((_, el) => {
                     try {
@@ -192,32 +261,28 @@ async function main() {
                         if (text) {
                             const parsed = JSON.parse(text);
                             const items = Array.isArray(parsed) ? parsed : [parsed];
-                            for (const item of items) {
-                                if (item?.['@type'] === 'JobPosting') {
-                                    jsonLd = item;
-                                    break;
-                                }
-                            }
+                            const found = items.find(item => item?.['@type'] === 'JobPosting');
+                            if (found) jsonLd = found;
                         }
-                    } catch { }
+                    } catch { /* Invalid JSON - skip */ }
                 });
 
-                // ====== Title ======
+                // Extract Title
                 const title = jsonLd?.title || jsonLd?.name ||
                     $('h1').first().text().trim() ||
                     $('meta[property="og:title"]').attr('content')?.split('|')[0]?.trim();
 
-                // ====== Description HTML (with tags) ======
+                // Extract Description HTML
                 let descriptionHtml = '';
                 if (jsonLd?.description) {
                     descriptionHtml = jsonLd.description;
                 } else {
                     const sections = [];
+                    const relevantHeadings = ['about', 'description', 'applicant', 'offer', 'job summary', 'responsibilities'];
+
                     $('h2').each((_, h2) => {
                         const heading = $(h2).text().toLowerCase();
-                        if (heading.includes('about') || heading.includes('description') ||
-                            heading.includes('applicant') || heading.includes('offer') ||
-                            heading.includes('job summary') || heading.includes('responsibilities')) {
+                        if (relevantHeadings.some(term => heading.includes(term))) {
                             let sectionHtml = '';
                             $(h2).nextUntil('h2').each((_, sib) => {
                                 sectionHtml += $.html(sib);
@@ -229,16 +294,19 @@ async function main() {
                     });
                     descriptionHtml = sections.length > 0
                         ? sections.join('')
-                        : $('article, main .content, .job-description, .job-content').first().html() || '';
+                        : ($('article, main .content, .job-description, .job-content').first().html() || '');
                 }
 
-                // ====== Location ======
+                // Extract Location
                 let jobLocation = null;
                 if (jsonLd?.jobLocation) {
                     const loc = Array.isArray(jsonLd.jobLocation) ? jsonLd.jobLocation[0] : jsonLd.jobLocation;
                     if (loc?.address) {
-                        jobLocation = [loc.address.addressLocality, loc.address.addressRegion, loc.address.addressCountry]
-                            .filter(Boolean).join(', ');
+                        jobLocation = [
+                            loc.address.addressLocality,
+                            loc.address.addressRegion,
+                            loc.address.addressCountry
+                        ].filter(Boolean).join(', ');
                     }
                 }
                 if (!jobLocation) {
@@ -247,7 +315,7 @@ async function main() {
                         $('.job-location').text().trim() || null;
                 }
 
-                // ====== Salary ======
+                // Extract Salary
                 let salary = null;
                 if (jsonLd?.baseSalary) {
                     const bs = jsonLd.baseSalary;
@@ -269,44 +337,38 @@ async function main() {
                         $('.job-salary, .salary').text().trim() || null;
                 }
 
-                // ====== Job Type / Contract Type ======
+                // Extract Job Type / Contract Type
                 let jobType = null;
                 if (jsonLd?.employmentType) {
-                    jobType = Array.isArray(jsonLd.employmentType) ? jsonLd.employmentType.join(', ') : jsonLd.employmentType;
+                    jobType = Array.isArray(jsonLd.employmentType)
+                        ? jsonLd.employmentType.join(', ')
+                        : jsonLd.employmentType;
                 }
                 if (!jobType) {
                     jobType = extractSummaryField($, 'contract') ||
                         extractSummaryField($, 'job type') ||
                         extractSummaryField($, 'employment') ||
-                        $('dd.field--item.summary-detail-field-value').filter((_, el) => {
-                            const prev = $(el).prev('dt').text().toLowerCase();
-                            return prev.includes('contract') || prev.includes('type');
-                        }).first().text().trim() ||
+                        extractFieldByDtLabel($, 'contract') ||
+                        extractFieldByDtLabel($, 'type') ||
                         $('[itemprop="employmentType"]').text().trim() ||
                         $('.job-contract-type').text().trim() || null;
                 }
 
-                // ====== Sector ======
-                let sector = extractSummaryField($, 'sector') ||
-                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
-                        return $(el).prev('dt').text().toLowerCase().includes('sector');
-                    }).first().text().trim() || null;
+                // Extract Sector
+                const sector = extractSummaryField($, 'sector') ||
+                    extractFieldByDtLabel($, 'sector') || null;
 
-                // ====== Industry ======
-                let industry = extractSummaryField($, 'industry') ||
-                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
-                        return $(el).prev('dt').text().toLowerCase().includes('industry');
-                    }).first().text().trim() ||
+                // Extract Industry
+                const industry = extractSummaryField($, 'industry') ||
+                    extractFieldByDtLabel($, 'industry') ||
                     jsonLd?.industry || null;
 
-                // ====== Job Nature (Permanent/Contract/Temporary) ======
-                let jobNature = extractSummaryField($, 'job nature') ||
+                // Extract Job Nature (Permanent/Contract/Temporary)
+                const jobNature = extractSummaryField($, 'job nature') ||
                     extractSummaryField($, 'nature') ||
-                    $('dd.field--item.summary-detail-field-value').filter((_, el) => {
-                        return $(el).prev('dt').text().toLowerCase().includes('nature');
-                    }).first().text().trim() || null;
+                    extractFieldByDtLabel($, 'nature') || null;
 
-                // ====== Company ======
+                // Extract Company
                 let company = null;
                 if (jsonLd?.hiringOrganization) {
                     company = typeof jsonLd.hiringOrganization === 'string'
@@ -316,15 +378,13 @@ async function main() {
                 if (!company) {
                     company = extractSummaryField($, 'company') ||
                         extractSummaryField($, 'employer') ||
-                        $('dd.field--item.summary-detail-field-value').filter((_, el) => {
-                            const prev = $(el).prev('dt').text().toLowerCase();
-                            return prev.includes('company') || prev.includes('employer');
-                        }).first().text().trim() ||
+                        extractFieldByDtLabel($, 'company') ||
+                        extractFieldByDtLabel($, 'employer') ||
                         $('[itemprop="hiringOrganization"] [itemprop="name"]').text().trim() ||
                         $('.company-name').text().trim() || null;
                 }
 
-                // ====== Date Posted ======
+                // Extract Date Posted
                 let datePosted = jsonLd?.datePosted || null;
                 if (!datePosted) {
                     datePosted = extractSummaryField($, 'posted') ||
@@ -335,15 +395,16 @@ async function main() {
                         $('.posted-date, .date-posted').text().trim() || null;
                 }
 
+                // Build final data object
                 const data = {
                     title: title || null,
-                    company: company,
+                    company,
                     location: jobLocation,
-                    salary: salary,
+                    salary,
                     job_type: jobType,
                     job_nature: jobNature,
-                    sector: sector,
-                    industry: industry,
+                    sector,
+                    industry,
                     date_posted: datePosted,
                     description_html: descriptionHtml || null,
                     description_text: cleanText(descriptionHtml),
@@ -364,7 +425,7 @@ async function main() {
                 }
             },
 
-            async failedRequestHandler({ request }, error) {
+            async failedRequestHandler({ request }) {
                 log.debug(`Failed: ${request.url}`);
             },
         });
