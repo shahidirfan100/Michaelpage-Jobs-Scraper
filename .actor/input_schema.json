@@ -47,10 +47,7 @@
       "description": "Use Apify Proxy for reliable scraping. Residential proxies recommended.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": true,
-        "apifyProxyGroups": [
-          "RESIDENTIAL"
-        ]
+        "useApifyProxy": false
       }
     }
   },
