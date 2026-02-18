@@ -1,446 +1,471 @@
 /**
- * Michael Page Jobs Scraper - Optimized Hybrid Approach v3
- * Fast Playwright for listings, HTTP for details with proper field extraction
- * 
- * @description A production-ready Apify Actor that scrapes job listings from Michael Page.
- * Uses a two-phase approach: Playwright for pagination-heavy listing pages,
- * and CheerioCrawler for fast detail page extraction.
+ * Michael Page Jobs Scraper
+ *
+ * Fast listing pagination + concurrent detail enrichment + batched dataset pushes.
  */
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
+import { Dataset, gotScraping } from 'crawlee';
 
+log.setLevel(log.LEVELS.WARNING);
 await Actor.init();
 
-/**
- * Strips HTML tags and normalizes whitespace from a string.
- * @param {string} html - The HTML string to clean
- * @returns {string} Plain text with normalized whitespace
- */
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
+const BASE_URL = 'https://www.michaelpage.com';
+const PUSH_BATCH_SIZE = 25;
+const DETAIL_CONCURRENCY = 12;
+
 const cleanText = (html) => {
     if (!html) return '';
-    return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-};
-
-/**
- * Extracts a field value from the job summary section by its label.
- * Searches through dt/dd pairs in the DOM to find matching fields.
- * @param {CheerioAPI} $ - Cheerio instance loaded with the page HTML
- * @param {string} labelText - The label text to search for (case-insensitive)
- * @returns {string|null} The extracted value or null if not found
- */
-const extractSummaryField = ($, labelText) => {
-    const searchLabel = labelText.toLowerCase();
-    let value = null;
-
-    // Primary: Search dt elements for matching label
-    $('dt').each((_, dt) => {
-        const label = $(dt).text().toLowerCase().trim();
-        if (label.includes(searchLabel)) {
-            value = $(dt).next('dd').text().trim() ||
-                $(dt).next('dd.field--item').text().trim() ||
-                $(dt).siblings('dd.field--item').first().text().trim();
-        }
-    });
-
-    // Fallback: Search dl structure
-    if (!value) {
-        $('dl').each((_, dl) => {
-            const dt = $(dl).find('dt').text().toLowerCase().trim();
-            if (dt.includes(searchLabel)) {
-                value = $(dl).find('dd.field--item, dd.summary-detail-field-value').text().trim();
-            }
-        });
-    }
-
-    return value || null;
-};
-
-/**
- * Extracts field value from dd elements by checking previous dt label.
- * @param {CheerioAPI} $ - Cheerio instance
- * @param {string} labelText - Label to match in previous dt element
- * @returns {string|null} Extracted value or null
- */
-const extractFieldByDtLabel = ($, labelText) => {
-    const searchLabel = labelText.toLowerCase();
-    const result = $('dd.field--item.summary-detail-field-value')
-        .filter((_, el) => $(el).prev('dt').text().toLowerCase().includes(searchLabel))
-        .first()
-        .text()
+    return String(html)
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
         .trim();
-    return result || null;
 };
 
-/**
- * Builds the Michael Page search URL with query parameters.
- * @param {string} keyword - Job search keyword
- * @param {string} location - Location filter
- * @returns {string} Complete search URL
- */
+const decodeHtmlEntities = (value) => {
+    if (!value) return '';
+    return String(value)
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#039;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#(\d+);/g, (_, n) => {
+            const code = Number(n);
+            return Number.isFinite(code) ? String.fromCharCode(code) : _;
+        })
+        .replace(/\s+/g, ' ')
+        .trim();
+};
+
 const buildStartUrl = (keyword, location) => {
-    const url = new URL('https://www.michaelpage.com/jobs');
+    const url = new URL(`${BASE_URL}/jobs`);
     if (keyword) url.searchParams.set('search', String(keyword).trim());
     if (location) url.searchParams.set('location', String(location).trim());
     return url.href;
 };
 
-/**
- * Main scraper entry point.
- * Orchestrates the two-phase scraping process.
- * @returns {Promise<void>}
- */
-async function main() {
-    try {
-        const input = (await Actor.getInput()) || {};
-        const {
-            keyword = '',
-            location = '',
-            results_wanted: RESULTS_WANTED_RAW = 20,
-            max_pages: MAX_PAGES_RAW = 10,
-            collectDetails = true,
-            startUrl,
-            startUrls,
+const buildPagedUrl = (baseListingUrl, pageNo) => {
+    const url = new URL(baseListingUrl);
+    if (pageNo > 0) url.searchParams.set('page', String(pageNo));
+    else url.searchParams.delete('page');
+    return url.href;
+};
+
+const sanitizeJsonWithControlCharsInStrings = (raw) => {
+    const input = String(raw);
+    let out = '';
+    let inString = false;
+    let escapeNext = false;
+
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+
+        if (escapeNext) {
+            out += ch;
+            escapeNext = false;
+            continue;
+        }
+
+        if (inString && ch === '\\') {
+            out += ch;
+            escapeNext = true;
+            continue;
+        }
+
+        if (ch === '"') {
+            out += ch;
+            inString = !inString;
+            continue;
+        }
+
+        if (inString) {
+            if (ch === '\n') {
+                out += '\\n';
+                continue;
+            }
+            if (ch === '\r') {
+                out += '\\r';
+                continue;
+            }
+            if (ch === '\t') {
+                out += '\\t';
+                continue;
+            }
+            if (ch === '\f') {
+                out += '\\f';
+                continue;
+            }
+            if (ch === '\b') {
+                out += '\\b';
+                continue;
+            }
+        }
+
+        out += ch;
+    }
+
+    return out;
+};
+
+const extractJobsFromListingHtml = (html) => {
+    const out = [];
+    const content = String(html);
+
+    for (const match of content.matchAll(/<li class="views-row">([\s\S]*?)<\/li>/g)) {
+        const row = match[1];
+
+        const aboutPath = row.match(/<div[^>]+about="([^"]+)"[^>]*class="job-tile/iu)?.[1];
+        const hrefPath = row.match(/<a[^>]+href="(\/job-detail\/[^"]+)"/iu)?.[1];
+        const path = aboutPath || hrefPath;
+        if (!path) continue;
+
+        const url = new URL(path, BASE_URL).href;
+        const listingJobId = row.match(/<div class="job-title[^"]*" id="(\d+)"/iu)?.[1] || null;
+        const titleRaw = row.match(/<h3>\s*<a[^>]*>([\s\S]*?)<\/a>/iu)?.[1] || '';
+        const locationBlock = row.match(/<div class="job-location">([\s\S]*?)<\/div>/iu)?.[1] || '';
+        const contractBlock = row.match(/<div class="job-contract-type">([\s\S]*?)<\/div>/iu)?.[1] || '';
+        const salaryBlock = row.match(/<div class="job-salary">([\s\S]*?)<\/div>/iu)?.[1] || '';
+        const summaryBlock = row.match(/job_advert__job-summary-text">([\s\S]*?)<\/div>/iu)?.[1] || '';
+        const bulletsBlock = row.match(/job_advert__job-desc-bullet-points">([\s\S]*?)<\/div>/iu)?.[1] || '';
+
+        const title = decodeHtmlEntities(cleanText(titleRaw)) || null;
+        const location = decodeHtmlEntities(cleanText(locationBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
+        const jobType = decodeHtmlEntities(cleanText(contractBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
+        const salary = decodeHtmlEntities(cleanText(salaryBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
+        const summary = decodeHtmlEntities(cleanText(summaryBlock)) || null;
+        const bulletPoints = Array.from(bulletsBlock.matchAll(/<li>([\s\S]*?)<\/li>/giu))
+            .map((m) => decodeHtmlEntities(cleanText(m[1])))
+            .filter(Boolean);
+
+        out.push({
+            listing_job_id: listingJobId,
+            title,
+            location: location || null,
+            salary: salary || null,
+            job_type: jobType || null,
+            summary,
+            bullet_points: bulletPoints.length ? bulletPoints : null,
             url,
-            proxyConfiguration,
-        } = input;
+        });
+    }
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
-            ? Math.max(1, +RESULTS_WANTED_RAW)
-            : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
-            ? Math.max(1, +MAX_PAGES_RAW)
-            : 999;
+    return out;
+};
 
-        log.info('Starting Michael Page scraper', { keyword, location, RESULTS_WANTED, MAX_PAGES });
+const extractJobPostingJsonLd = (html) => {
+    const content = String(html);
+    const results = [];
 
-        // Build initial URLs from various input sources
-        const initial = [];
-        if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-        if (startUrl) initial.push(startUrl);
-        if (url) initial.push(url);
-        if (!initial.length) initial.push(buildStartUrl(keyword, location));
+    let idx = 0;
+    while (true) {
+        const hit = content.indexOf('application/ld+json', idx);
+        if (hit === -1) break;
 
-        // Setup proxy configuration
-        let proxyConf;
-        try {
-            proxyConf = proxyConfiguration
-                ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-                : await Actor.createProxyConfiguration({
-                    useApifyProxy: true,
-                    apifyProxyGroups: ['RESIDENTIAL']
-                });
-        } catch (err) {
-            log.warning(`Proxy error: ${err.message}`);
-            proxyConf = undefined;
+        const scriptStart = content.lastIndexOf('<script', hit);
+        if (scriptStart === -1) {
+            idx = hit + 1;
+            continue;
         }
 
-        let saved = 0;
-        const seenUrls = new Set();
-        const jobUrls = [];
+        const tagEnd = content.indexOf('>', scriptStart);
+        if (tagEnd === -1) {
+            idx = hit + 1;
+            continue;
+        }
 
-        // ============================================================
-        // PHASE 1: Fast Playwright for listing pages only
-        // ============================================================
-        log.info('Phase 1: Collecting job URLs...');
+        const close = content.indexOf('</script>', tagEnd + 1);
+        if (close === -1) {
+            idx = hit + 1;
+            continue;
+        }
 
-        const listingCrawler = new PlaywrightCrawler({
-            proxyConfiguration: proxyConf,
-            maxRequestRetries: 2,
-            useSessionPool: true,
-            persistCookiesPerSession: true,
-            maxConcurrency: 1,
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 45,
-
-            launchContext: {
-                launchOptions: {
-                    headless: true,
-                    args: [
-                        '--disable-blink-features=AutomationControlled',
-                        '--no-sandbox',
-                        '--disable-gpu'
-                    ],
-                },
-            },
-
-            preNavigationHooks: [
-                async ({ page }) => {
-                    // Hide webdriver property to avoid detection
-                    await page.addInitScript(() => {
-                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    });
-                    // Block unnecessary resources for faster loading
-                    await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}', route => route.abort());
-                },
-            ],
-
-            async requestHandler({ request, page, log: crawlerLog }) {
-                const pageNo = request.userData?.pageNo || 0;
-                crawlerLog.info(`[LIST] Page ${pageNo + 1}`);
-
-                await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-
-                // Dismiss cookie consent if present
+        const raw = content.slice(tagEnd + 1, close).trim();
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) results.push(...parsed);
+                else results.push(parsed);
+            } catch {
                 try {
-                    const cookieBtn = page.locator('button:has-text("Accept")').first();
-                    if (await cookieBtn.isVisible({ timeout: 1500 })) {
-                        await cookieBtn.click();
-                    }
-                } catch { /* Cookie button not found - continue */ }
-
-                await page.waitForTimeout(1500);
-
-                // Extract unique job detail links
-                const links = await page.$$eval('a[href*="/job-detail/"]', (anchors) =>
-                    [...new Set(anchors.map(a => a.href).filter(h => h && !h.includes('javascript:')))]
-                );
-
-                const uniqueLinks = links.filter(link => {
-                    if (seenUrls.has(link)) return false;
-                    seenUrls.add(link);
-                    return true;
-                });
-
-                jobUrls.push(...uniqueLinks);
-                crawlerLog.info(`Found ${uniqueLinks.length} links (total: ${jobUrls.length})`);
-
-                // Paginate if more results needed
-                if (jobUrls.length < RESULTS_WANTED && pageNo < MAX_PAGES - 1 && uniqueLinks.length > 0) {
-                    const nextUrl = new URL(request.url);
-                    nextUrl.searchParams.set('page', String(pageNo + 1));
-                    await listingCrawler.addRequests([{
-                        url: nextUrl.href,
-                        userData: { pageNo: pageNo + 1 }
-                    }]);
+                    const sanitized = sanitizeJsonWithControlCharsInStrings(raw);
+                    const parsed = JSON.parse(sanitized);
+                    if (Array.isArray(parsed)) results.push(...parsed);
+                    else results.push(parsed);
+                } catch {
+                    // ignore invalid JSON-LD blocks
                 }
-            },
-        });
-
-        await listingCrawler.run(initial.map(u => ({ url: u, userData: { pageNo: 0 } })));
-        log.info(`Phase 1 done. Collected ${jobUrls.length} URLs`);
-
-        if (jobUrls.length === 0) {
-            log.warning('No job URLs found');
-            await Actor.exit();
-            return;
+            }
         }
 
-        // ============================================================
-        // PHASE 2: Fast HTTP for detail pages
-        // ============================================================
-        if (!collectDetails) {
-            const toSave = jobUrls.slice(0, RESULTS_WANTED);
-            await Dataset.pushData(toSave.map(u => ({
-                url: u,
-                scrapedAt: new Date().toISOString()
-            })));
-            log.info(`Saved ${toSave.length} URLs`);
-            await Actor.exit();
-            return;
-        }
+        idx = close + 9;
+    }
 
-        log.info('Phase 2: Fetching details...');
+    return results.find((x) => x && typeof x === 'object' && x['@type'] === 'JobPosting') || null;
+};
 
-        const urlsToFetch = jobUrls.slice(0, RESULTS_WANTED);
-        log.info(`Queuing ${urlsToFetch.length} detail URLs`);
+const normalizeBaseSalary = (baseSalary) => {
+    if (!baseSalary) return null;
+    if (typeof baseSalary === 'string') return baseSalary;
 
-        const detailCrawler = new CheerioCrawler({
-            proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
-            maxConcurrency: 15,
-            requestHandlerTimeoutSecs: 20,
+    const currency = baseSalary.currency || baseSalary?.value?.currency || null;
+    const unitText = baseSalary?.value?.unitText || null;
+    const { value } = baseSalary;
 
-            async requestHandler({ request, $, log: crawlerLog }) {
-                if (saved >= RESULTS_WANTED) return;
+    if (value && typeof value === 'object') {
+        return {
+            currency,
+            unitText,
+            minValue: value.minValue ?? null,
+            maxValue: value.maxValue ?? null,
+            value: value.value ?? null,
+        };
+    }
 
-                // Extract JSON-LD structured data (primary source)
-                let jsonLd = null;
-                $('script[type="application/ld+json"]').each((_, el) => {
-                    try {
-                        const text = $(el).html();
-                        if (text) {
-                            const parsed = JSON.parse(text);
-                            const items = Array.isArray(parsed) ? parsed : [parsed];
-                            const found = items.find(item => item?.['@type'] === 'JobPosting');
-                            if (found) jsonLd = found;
-                        }
-                    } catch { /* Invalid JSON - skip */ }
-                });
+    return {
+        currency,
+        unitText,
+        value,
+    };
+};
 
-                // Extract Title
-                const title = jsonLd?.title || jsonLd?.name ||
-                    $('h1').first().text().trim() ||
-                    $('meta[property="og:title"]').attr('content')?.split('|')[0]?.trim();
+const removeNullValues = (value) => {
+    if (value === null || value === undefined) return undefined;
 
-                // Extract Description HTML
-                let descriptionHtml = '';
-                if (jsonLd?.description) {
-                    descriptionHtml = jsonLd.description;
-                } else {
-                    const sections = [];
-                    const relevantHeadings = ['about', 'description', 'applicant', 'offer', 'job summary', 'responsibilities'];
+    if (Array.isArray(value)) {
+        const cleaned = value
+            .map((item) => removeNullValues(item))
+            .filter((item) => item !== undefined);
+        return cleaned.length ? cleaned : undefined;
+    }
 
-                    $('h2').each((_, h2) => {
-                        const heading = $(h2).text().toLowerCase();
-                        if (relevantHeadings.some(term => heading.includes(term))) {
-                            let sectionHtml = '';
-                            $(h2).nextUntil('h2').each((_, sib) => {
-                                sectionHtml += $.html(sib);
-                            });
-                            if (sectionHtml.trim()) {
-                                sections.push(`<h2>${$(h2).text()}</h2>${sectionHtml}`);
-                            }
-                        }
-                    });
-                    descriptionHtml = sections.length > 0
-                        ? sections.join('')
-                        : ($('article, main .content, .job-description, .job-content').first().html() || '');
-                }
+    if (typeof value === 'object') {
+        const cleanedEntries = Object.entries(value)
+            .map(([key, val]) => [key, removeNullValues(val)])
+            .filter(([, val]) => val !== undefined);
+        return cleanedEntries.length ? Object.fromEntries(cleanedEntries) : undefined;
+    }
 
-                // Extract Location
-                let jobLocation = null;
-                if (jsonLd?.jobLocation) {
-                    const loc = Array.isArray(jsonLd.jobLocation) ? jsonLd.jobLocation[0] : jsonLd.jobLocation;
-                    if (loc?.address) {
-                        jobLocation = [
-                            loc.address.addressLocality,
-                            loc.address.addressRegion,
-                            loc.address.addressCountry
-                        ].filter(Boolean).join(', ');
-                    }
-                }
-                if (!jobLocation) {
-                    jobLocation = extractSummaryField($, 'location') ||
-                        $('[itemprop="addressLocality"]').text().trim() ||
-                        $('.job-location').text().trim() || null;
-                }
+    return value;
+};
 
-                // Extract Salary
-                let salary = null;
-                if (jsonLd?.baseSalary) {
-                    const bs = jsonLd.baseSalary;
-                    if (typeof bs === 'string') {
-                        salary = bs;
-                    } else if (bs?.value) {
-                        const val = bs.value;
-                        const currency = bs.currency || '';
-                        if (typeof val === 'object') {
-                            salary = `${currency} ${val.minValue || ''} - ${val.maxValue || ''}`.trim();
-                        } else {
-                            salary = `${currency} ${val}`.trim();
-                        }
-                    }
-                }
-                if (!salary) {
-                    salary = extractSummaryField($, 'salary') ||
-                        $('[itemprop="baseSalary"]').text().trim() ||
-                        $('.job-salary, .salary').text().trim() || null;
-                }
+const getJobLocationText = (jobPosting) => {
+    const loc = Array.isArray(jobPosting?.jobLocation) ? jobPosting.jobLocation[0] : jobPosting?.jobLocation;
+    const addr = loc?.address;
+    if (!addr) return null;
+    return [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean).join(', ') || null;
+};
 
-                // Extract Job Type / Contract Type
-                let jobType = null;
-                if (jsonLd?.employmentType) {
-                    jobType = Array.isArray(jsonLd.employmentType)
-                        ? jsonLd.employmentType.join(', ')
-                        : jsonLd.employmentType;
-                }
-                if (!jobType) {
-                    jobType = extractSummaryField($, 'contract') ||
-                        extractSummaryField($, 'job type') ||
-                        extractSummaryField($, 'employment') ||
-                        extractFieldByDtLabel($, 'contract') ||
-                        extractFieldByDtLabel($, 'type') ||
-                        $('[itemprop="employmentType"]').text().trim() ||
-                        $('.job-contract-type').text().trim() || null;
-                }
+const getIdentifierValue = (identifier) => {
+    if (!identifier) return null;
+    if (typeof identifier === 'string') return identifier;
+    if (typeof identifier === 'object') return identifier.value || identifier['@id'] || null;
+    return null;
+};
 
-                // Extract Sector
-                const sector = extractSummaryField($, 'sector') ||
-                    extractFieldByDtLabel($, 'sector') || null;
+const pushBatch = async (items, savedCount) => {
+    if (!items.length) return savedCount;
+    await Dataset.pushData(items);
+    const nextSavedCount = savedCount + items.length;
+    log.warning('Detail data push', { batchSize: items.length, totalSaved: nextSavedCount });
+    return nextSavedCount;
+};
 
-                // Extract Industry
-                const industry = extractSummaryField($, 'industry') ||
-                    extractFieldByDtLabel($, 'industry') ||
-                    jsonLd?.industry || null;
+const fetchListingPage = async ({ pageUrl, proxyConf }) => {
+    const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
+    const { body } = await gotScraping({
+        url: pageUrl,
+        method: 'GET',
+        headers: {
+            'user-agent': USER_AGENT,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+        },
+        proxyUrl,
+        timeout: {
+            request: 60000,
+        },
+        retry: {
+            limit: 2,
+        },
+    });
+    return body;
+};
 
-                // Extract Job Nature (Permanent/Contract/Temporary)
-                const jobNature = extractSummaryField($, 'job nature') ||
-                    extractSummaryField($, 'nature') ||
-                    extractFieldByDtLabel($, 'nature') || null;
+const fetchDetailRecord = async ({ detailUrl, listing, proxyConf }) => {
+    const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
+    const { body } = await gotScraping({
+        url: detailUrl,
+        method: 'GET',
+        headers: {
+            'user-agent': USER_AGENT,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            referer: `${BASE_URL}/jobs`,
+        },
+        proxyUrl,
+        timeout: {
+            request: 60000,
+        },
+        retry: {
+            limit: 2,
+        },
+    });
 
-                // Extract Company
-                let company = null;
-                if (jsonLd?.hiringOrganization) {
-                    company = typeof jsonLd.hiringOrganization === 'string'
-                        ? jsonLd.hiringOrganization
-                        : jsonLd.hiringOrganization.name;
-                }
-                if (!company) {
-                    company = extractSummaryField($, 'company') ||
-                        extractSummaryField($, 'employer') ||
-                        extractFieldByDtLabel($, 'company') ||
-                        extractFieldByDtLabel($, 'employer') ||
-                        $('[itemprop="hiringOrganization"] [itemprop="name"]').text().trim() ||
-                        $('.company-name').text().trim() || null;
-                }
+    const jobPosting = extractJobPostingJsonLd(body);
+    const descriptionHtml = jobPosting?.description || null;
+    const jobLocation = getJobLocationText(jobPosting);
+    const jobId = getIdentifierValue(jobPosting?.identifier);
+    const employmentType = Array.isArray(jobPosting?.employmentType)
+        ? jobPosting.employmentType.join(', ')
+        : (jobPosting?.employmentType || null);
 
-                // Extract Date Posted
-                let datePosted = jsonLd?.datePosted || null;
-                if (!datePosted) {
-                    datePosted = extractSummaryField($, 'posted') ||
-                        extractSummaryField($, 'date') ||
-                        $('[itemprop="datePosted"]').attr('content') ||
-                        $('[itemprop="datePosted"]').text().trim() ||
-                        $('time[datetime]').attr('datetime') ||
-                        $('.posted-date, .date-posted').text().trim() || null;
-                }
+    const data = {
+        title: listing.title || jobPosting?.title || jobPosting?.name || null,
+        company: listing.company || jobPosting?.hiringOrganization?.name || null,
+        location: listing.location || jobLocation || null,
+        salary: listing.salary || null,
+        job_type: listing.job_type || employmentType || null,
+        job_nature: listing.job_nature || null,
+        sector: listing.sector || null,
+        industry: listing.industry || jobPosting?.industry || null,
+        date_posted: listing.date_posted || jobPosting?.datePosted || null,
+        description_html: descriptionHtml,
+        description_text: cleanText(descriptionHtml || ''),
+        url: detailUrl,
+        scrapedAt: new Date().toISOString(),
+        listing_job_id: listing.listing_job_id || null,
+        job_id: jobId || null,
+        additional_type: jobPosting?.additionalType || null,
+        employment_type: jobPosting?.employmentType || null,
+        valid_through: jobPosting?.validThrough || null,
+        direct_apply: typeof jobPosting?.directApply === 'boolean' ? jobPosting.directApply : null,
+        job_location: jobPosting?.jobLocation || null,
+        base_salary: normalizeBaseSalary(jobPosting?.baseSalary),
+        job_benefits: jobPosting?.jobBenefits || null,
+        occupational_category: jobPosting?.occupationalCategory || null,
+        qualifications: jobPosting?.qualifications || null,
+        responsibilities: jobPosting?.responsibilities || null,
+        skills: jobPosting?.skills || null,
+        education_requirements: jobPosting?.educationRequirements || null,
+        experience_requirements: jobPosting?.experienceRequirements || null,
+        work_hours: jobPosting?.workHours || null,
+        hiring_organization: jobPosting?.hiringOrganization || null,
+        identifier: jobPosting?.identifier || null,
+        summary: listing.summary || null,
+        bullet_points: listing.bullet_points || null,
+    };
 
-                // Build final data object
-                const data = {
-                    title: title || null,
-                    company,
-                    location: jobLocation,
-                    salary,
-                    job_type: jobType,
-                    job_nature: jobNature,
-                    sector,
-                    industry,
-                    date_posted: datePosted,
-                    description_html: descriptionHtml || null,
-                    description_text: cleanText(descriptionHtml),
-                    url: request.url,
-                    scrapedAt: new Date().toISOString(),
-                };
+    return removeNullValues(data) || null;
+};
 
-                if (!data.title) {
-                    crawlerLog.debug(`No title: ${request.url}`);
-                    return;
-                }
+async function main() {
+    const input = (await Actor.getInput()) || {};
+    const {
+        keyword = '',
+        location = '',
+        results_wanted: resultsWantedRaw = 20,
+        max_pages: maxPagesRaw = 10,
+        startUrl,
+        startUrls,
+        url,
+        proxyConfiguration,
+    } = input;
 
-                await Dataset.pushData(data);
-                saved++;
+    const RESULTS_WANTED = Number.isFinite(+resultsWantedRaw)
+        ? Math.max(1, +resultsWantedRaw)
+        : Number.MAX_SAFE_INTEGER;
+    const MAX_PAGES = Number.isFinite(+maxPagesRaw)
+        ? Math.max(1, +maxPagesRaw)
+        : 999;
 
-                if (saved % 10 === 0 || saved === RESULTS_WANTED) {
-                    crawlerLog.info(`Progress: ${saved}/${RESULTS_WANTED}`);
-                }
-            },
+    const initial = [];
+    if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
+    if (startUrl) initial.push(startUrl);
+    if (url) initial.push(url);
+    if (!initial.length) initial.push(buildStartUrl(keyword, location));
+    const listingUrl = initial[0];
 
-            async failedRequestHandler({ request }) {
-                log.debug(`Failed: ${request.url}`);
-            },
-        });
-
-        await detailCrawler.run(urlsToFetch);
-        log.info(`Done. Saved ${saved} jobs.`);
-
+    let proxyConf;
+    try {
+        proxyConf = proxyConfiguration
+            ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
+            : await Actor.createProxyConfiguration({
+                useApifyProxy: true,
+                apifyProxyGroups: ['RESIDENTIAL'],
+            });
     } catch (err) {
-        log.error(`Fatal: ${err.message}`);
-    } finally {
-        await Actor.exit();
+        log.warning(`Proxy configuration failed: ${err.message}`);
+        proxyConf = undefined;
+    }
+
+    const foundByUrl = new Map();
+    const orderedUrls = [];
+
+    for (let pageNo = 0; pageNo < MAX_PAGES && orderedUrls.length < RESULTS_WANTED; pageNo++) {
+        const pageUrl = buildPagedUrl(listingUrl, pageNo);
+        const listingHtml = await fetchListingPage({ pageUrl, proxyConf });
+        const jobs = extractJobsFromListingHtml(listingHtml);
+        if (!jobs.length) break;
+
+        let newOnPage = 0;
+        for (const job of jobs) {
+            if (!job?.url || foundByUrl.has(job.url)) continue;
+            foundByUrl.set(job.url, job);
+            orderedUrls.push(job.url);
+            newOnPage++;
+            if (orderedUrls.length >= RESULTS_WANTED) break;
+        }
+
+        if (!newOnPage) break;
+    }
+
+    if (!orderedUrls.length) return;
+
+    const detailUrls = orderedUrls.slice(0, RESULTS_WANTED);
+    let savedCount = 0;
+    const pushBuffer = [];
+
+    for (let i = 0; i < detailUrls.length; i += DETAIL_CONCURRENCY) {
+        const chunk = detailUrls.slice(i, i + DETAIL_CONCURRENCY);
+        const settled = await Promise.allSettled(
+            chunk.map(async (detailUrl) => {
+                const listing = foundByUrl.get(detailUrl) || {};
+                try {
+                    return await fetchDetailRecord({ detailUrl, listing, proxyConf });
+                } catch {
+                    const fallback = removeNullValues({
+                        ...listing,
+                        url: detailUrl,
+                        scrapedAt: new Date().toISOString(),
+                    });
+                    return fallback || null;
+                }
+            }),
+        );
+
+        for (const result of settled) {
+            if (result.status !== 'fulfilled' || !result.value) continue;
+            pushBuffer.push(result.value);
+            if (pushBuffer.length >= PUSH_BATCH_SIZE) {
+                savedCount = await pushBatch(pushBuffer, savedCount);
+                pushBuffer.length = 0;
+            }
+        }
+
+        if (pushBuffer.length) {
+            savedCount = await pushBatch(pushBuffer, savedCount);
+            pushBuffer.length = 0;
+        }
     }
 }
 
-main().catch(err => {
-    console.error('Error:', err);
-    process.exit(1);
-});
+try {
+    await main();
+} catch (err) {
+    log.error(`Fatal: ${err?.message || err}`);
+} finally {
+    await Actor.exit();
+}

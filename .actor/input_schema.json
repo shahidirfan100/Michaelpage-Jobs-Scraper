@@ -1,6 +1,6 @@
 {
   "title": "Michael Page Jobs Scraper",
-  "description": "Scrape job listings from Michael Page. Provide keyword and location to search for jobs. The actor handles pagination and can optionally fetch detailed job descriptions.",
+  "description": "Scrape job listings from Michael Page with fast pagination and rich job-detail extraction, including full descriptions and structured fields.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -22,13 +22,6 @@
       "type": "string",
       "description": "Location filter for Michael Page jobs, e.g., 'New York', 'London'.",
       "editor": "textfield"
-    },
-    "collectDetails": {
-      "title": "Collect job details",
-      "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description.",
-      "editor": "checkbox",
-      "default": true
     },
     "results_wanted": {
       "title": "Maximum number of jobs",
