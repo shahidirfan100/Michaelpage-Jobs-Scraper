@@ -1,238 +1,254 @@
-/**
- * Michael Page Jobs Scraper
- *
- * Fast listing pagination + concurrent detail enrichment + batched dataset pushes.
- */
 import { Actor, log } from 'apify';
-import { Dataset, gotScraping } from 'crawlee';
+import { Impit } from 'impit';
 
-log.setLevel(log.LEVELS.WARNING);
-await Actor.init();
+const DOMAINS = [
+    'www.michaelpage.com',
+    'www.michaelpage.co.uk',
+    'www.michaelpage.fr',
+    'www.michaelpage.de',
+    'www.michaelpage.es',
+    'www.michaelpage.it',
+    'www.michaelpage.nl',
+    'www.michaelpage.ch',
+    'www.michaelpage.be',
+    'www.michaelpage.at',
+    'www.michaelpage.ie',
+    'www.michaelpage.pt',
+    'www.michaelpage.ae',
+    'www.michaelpage.com.au',
+    'www.michaelpage.ca',
+    'www.michaelpage.com.sg',
+    'www.michaelpage.com.hk',
+    'www.michaelpage.com.cn',
+    'www.michaelpage.co.jp',
+    'www.michaelpage.com.mx',
+    'www.michaelpage.com.br',
+];
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
-const BASE_URL = 'https://www.michaelpage.com';
-const PUSH_BATCH_SIZE = 25;
-const DETAIL_CONCURRENCY = 12;
-
-const cleanText = (html) => {
-    if (!html) return '';
-    return String(html)
-        .replace(/<[^>]*>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+const MARKET_COUNTRIES = {
+    'www.michaelpage.com': 'US',
+    'www.michaelpage.co.uk': 'GB',
+    'www.michaelpage.fr': 'FR',
+    'www.michaelpage.de': 'DE',
+    'www.michaelpage.es': 'ES',
+    'www.michaelpage.it': 'IT',
+    'www.michaelpage.nl': 'NL',
+    'www.michaelpage.ch': 'CH',
+    'www.michaelpage.be': 'BE',
+    'www.michaelpage.at': 'AT',
+    'www.michaelpage.ie': 'IE',
+    'www.michaelpage.pt': 'PT',
+    'www.michaelpage.ae': 'AE',
+    'www.michaelpage.com.au': 'AU',
+    'www.michaelpage.ca': 'CA',
+    'www.michaelpage.com.sg': 'SG',
+    'www.michaelpage.com.hk': 'HK',
+    'www.michaelpage.com.cn': 'CN',
+    'www.michaelpage.co.jp': 'JP',
+    'www.michaelpage.com.mx': 'MX',
+    'www.michaelpage.com.br': 'BR',
 };
 
-const decodeHtmlEntities = (value) => {
+const DEFAULT_DOMAIN = 'www.michaelpage.com';
+const PROFILE_POOL = ['chrome151', 'chrome142', 'firefox144', 'ios18', 'okhttp5'];
+const MAX_ATTEMPTS = 4;
+const MAX_REDIRECTS = 5;
+const MAX_PAGES_HARD_LIMIT = 200;
+const REQUEST_TIMEOUT_MS = 45000;
+const BASE_RETRY_DELAY_MS = 900;
+const MAX_RETRY_DELAY_MS = 15000;
+const PACE_MIN_DIRECT_MS = 350;
+const PACE_MAX_DIRECT_MS = 2500;
+const PACE_MIN_PROXY_MS = 180;
+const PACE_MAX_PROXY_MS = 1500;
+const PROXY_POOL_MAX = 8;
+const DEFAULT_DETAIL_CONCURRENCY = 6;
+const MAX_DETAIL_CONCURRENCY = 20;
+const SECOND_PASS_CONCURRENCY = 2;
+const PUSH_BATCH_SIZE = 10;
+
+const EMPTY_DETAIL = {
+    title: null,
+    location: null,
+    salary: null,
+    contractType: null,
+    companyType: null,
+    jobNature: null,
+    descriptionHtml: null,
+    applyUrl: null,
+    consultant: null,
+    jobReference: null,
+    sector: null,
+    subSector: null,
+    industry: null,
+};
+
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
+
+const normalizeText = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const normalizePositiveInt = (value, fallback) => {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 1) return fallback;
+    return Math.floor(number);
+};
+
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const decodeEntities = (value) => {
     if (!value) return '';
     return String(value)
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
-        .replace(/&#039;/g, "'")
-        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&#0?39;/g, "'")
         .replace(/&nbsp;/g, ' ')
-        .replace(/&#(\d+);/g, (_, n) => {
-            const code = Number(n);
-            return Number.isFinite(code) ? String.fromCharCode(code) : _;
+        .replace(/&ndash;/g, '-')
+        .replace(/&mdash;/g, '-')
+        .replace(/&euro;/g, 'EUR')
+        .replace(/&pound;/g, 'GBP')
+        .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+            const code = Number.parseInt(hex, 16);
+            return Number.isFinite(code) ? String.fromCodePoint(code) : _;
         })
-        .replace(/\s+/g, ' ')
-        .trim();
-};
-
-const buildStartUrl = (keyword, location) => {
-    const url = new URL(`${BASE_URL}/jobs`);
-    if (keyword) url.searchParams.set('search', String(keyword).trim());
-    if (location) url.searchParams.set('location', String(location).trim());
-    return url.href;
-};
-
-const buildPagedUrl = (baseListingUrl, pageNo) => {
-    const url = new URL(baseListingUrl);
-    if (pageNo > 0) url.searchParams.set('page', String(pageNo));
-    else url.searchParams.delete('page');
-    return url.href;
-};
-
-const sanitizeJsonWithControlCharsInStrings = (raw) => {
-    const input = String(raw);
-    let out = '';
-    let inString = false;
-    let escapeNext = false;
-
-    for (let i = 0; i < input.length; i++) {
-        const ch = input[i];
-
-        if (escapeNext) {
-            out += ch;
-            escapeNext = false;
-            continue;
-        }
-
-        if (inString && ch === '\\') {
-            out += ch;
-            escapeNext = true;
-            continue;
-        }
-
-        if (ch === '"') {
-            out += ch;
-            inString = !inString;
-            continue;
-        }
-
-        if (inString) {
-            if (ch === '\n') {
-                out += '\\n';
-                continue;
-            }
-            if (ch === '\r') {
-                out += '\\r';
-                continue;
-            }
-            if (ch === '\t') {
-                out += '\\t';
-                continue;
-            }
-            if (ch === '\f') {
-                out += '\\f';
-                continue;
-            }
-            if (ch === '\b') {
-                out += '\\b';
-                continue;
-            }
-        }
-
-        out += ch;
-    }
-
-    return out;
-};
-
-const extractJobsFromListingHtml = (html) => {
-    const out = [];
-    const content = String(html);
-
-    for (const match of content.matchAll(/<li class="views-row">([\s\S]*?)<\/li>/g)) {
-        const row = match[1];
-
-        const aboutPath = row.match(/<div[^>]+about="([^"]+)"[^>]*class="job-tile/iu)?.[1];
-        const hrefPath = row.match(/<a[^>]+href="(\/job-detail\/[^"]+)"/iu)?.[1];
-        const path = aboutPath || hrefPath;
-        if (!path) continue;
-
-        const url = new URL(path, BASE_URL).href;
-        const listingJobId = row.match(/<div class="job-title[^"]*" id="(\d+)"/iu)?.[1] || null;
-        const titleRaw = row.match(/<h3>\s*<a[^>]*>([\s\S]*?)<\/a>/iu)?.[1] || '';
-        const locationBlock = row.match(/<div class="job-location">([\s\S]*?)<\/div>/iu)?.[1] || '';
-        const contractBlock = row.match(/<div class="job-contract-type">([\s\S]*?)<\/div>/iu)?.[1] || '';
-        const salaryBlock = row.match(/<div class="job-salary">([\s\S]*?)<\/div>/iu)?.[1] || '';
-        const summaryBlock = row.match(/job_advert__job-summary-text">([\s\S]*?)<\/div>/iu)?.[1] || '';
-        const bulletsBlock = row.match(/job_advert__job-desc-bullet-points">([\s\S]*?)<\/div>/iu)?.[1] || '';
-
-        const title = decodeHtmlEntities(cleanText(titleRaw)) || null;
-        const location = decodeHtmlEntities(cleanText(locationBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
-        const jobType = decodeHtmlEntities(cleanText(contractBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
-        const salary = decodeHtmlEntities(cleanText(salaryBlock.replace(/<i[\s\S]*?<\/i>/iu, '')));
-        const summary = decodeHtmlEntities(cleanText(summaryBlock)) || null;
-        const bulletPoints = Array.from(bulletsBlock.matchAll(/<li>([\s\S]*?)<\/li>/giu))
-            .map((m) => decodeHtmlEntities(cleanText(m[1])))
-            .filter(Boolean);
-
-        out.push({
-            listing_job_id: listingJobId,
-            title,
-            location: location || null,
-            salary: salary || null,
-            job_type: jobType || null,
-            summary,
-            bullet_points: bulletPoints.length ? bulletPoints : null,
-            url,
+        .replace(/&#(\d+);/g, (_, digits) => {
+            const code = Number(digits);
+            return Number.isFinite(code) ? String.fromCodePoint(code) : _;
         });
-    }
-
-    return out;
 };
 
-const extractJobPostingJsonLd = (html) => {
-    const content = String(html);
-    const results = [];
+const stripTags = (html) => {
+    if (!html) return '';
+    const separated = String(html)
+        .replace(/<br\s*\/?>/gi, ' ')
+        .replace(/<\/(p|li|div|dd|dt|h[1-6]|tr|span)>/gi, ' ')
+        .replace(/<[^>]*>/g, ' ');
+    return decodeEntities(separated).replace(/\s+/g, ' ').trim();
+};
 
-    let idx = 0;
-    while (true) {
-        const hit = content.indexOf('application/ld+json', idx);
-        if (hit === -1) break;
+const readBlock = (html, className) => {
+    if (!html) return '';
+    const pattern = new RegExp(
+        `<([a-z0-9]+)\\b[^>]*class=["'][^"']*(?<![\\w-])${escapeRegExp(className)}(?![\\w-])[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`,
+        'i',
+    );
+    return html.match(pattern)?.[2] || '';
+};
 
-        const scriptStart = content.lastIndexOf('<script', hit);
-        if (scriptStart === -1) {
-            idx = hit + 1;
-            continue;
-        }
-
-        const tagEnd = content.indexOf('>', scriptStart);
-        if (tagEnd === -1) {
-            idx = hit + 1;
-            continue;
-        }
-
-        const close = content.indexOf('</script>', tagEnd + 1);
-        if (close === -1) {
-            idx = hit + 1;
-            continue;
-        }
-
-        const raw = content.slice(tagEnd + 1, close).trim();
-        if (raw) {
-            try {
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) results.push(...parsed);
-                else results.push(parsed);
-            } catch {
-                try {
-                    const sanitized = sanitizeJsonWithControlCharsInStrings(raw);
-                    const parsed = JSON.parse(sanitized);
-                    if (Array.isArray(parsed)) results.push(...parsed);
-                    else results.push(parsed);
-                } catch {
-                    // ignore invalid JSON-LD blocks
-                }
-            }
-        }
-
-        idx = close + 9;
+const firstText = (...values) => {
+    for (const value of values) {
+        const text = typeof value === 'string' ? value.trim() : '';
+        if (text) return text;
     }
+    return null;
+};
 
-    return results.find((x) => x && typeof x === 'object' && x['@type'] === 'JobPosting') || null;
+const getHeader = (headers, name) => {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name);
+    if (Array.isArray(headers)) {
+        const found = headers.find(([key]) => String(key).toLowerCase() === name.toLowerCase());
+        return found ? found[1] : null;
+    }
+    const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    return key ? headers[key] : null;
+};
+
+const parseRetryAfter = (headers) => {
+    const value = getHeader(headers, 'retry-after');
+    if (!value) return null;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return Math.max(0, timestamp - Date.now());
+    return null;
+};
+
+const isChallenge = (status, body) => {
+    if (status === 429) return true;
+    const sample = String(body).slice(0, 12000);
+    return /just a moment\.\.\.|cf-chl|enable javascript and cookies|attention required|checking your browser|cf-mitigated/i.test(sample);
+};
+
+const isClosedOffice = (body) => /CLOUDFLARE_ERROR_1000S_BOX|our office .{0,120} is now closed/i.test(String(body));
+
+const isRetryableStatus = (status) => status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
+
+const visibleText = (html) => stripTags(
+    String(html)
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' '),
+);
+
+const isNoResultsHtml = (html) => {
+    const text = visibleText(html);
+    return /search returned no results|aucun r[eé]sultat|keine ergebnisse|nessun risultato|no hay resultados|geen resultaten|sem resultados|没有找到|検索結果がありません/i.test(text);
+};
+
+const looksLikeDetail = (html) => /JobPosting|job-apply-job-title|job_advert__job-desc-role/i.test(String(html).slice(0, 400000));
+
+const jobKeyFromUrl = (url) => {
+    const reference = String(url).match(/\/ref\/([^/?#]+)/i)?.[1];
+    if (reference) return reference.toLowerCase();
+    try {
+        return new URL(url).pathname.toLowerCase().replace(/\/+$/, '');
+    } catch {
+        return null;
+    }
+};
+
+const getJobReferenceFromUrl = (url) => String(url).match(/\/ref\/([^/?#]+)/i)?.[1] || null;
+
+const formatJobLocation = (jobLocation) => {
+    if (!jobLocation) return null;
+    const first = Array.isArray(jobLocation) ? jobLocation[0] : jobLocation;
+    const address = first?.address || first;
+    if (!address || typeof address !== 'object') return null;
+    return firstText(
+        [address.addressLocality, address.addressRegion, address.addressCountry].filter(Boolean).join(', '),
+        address.name,
+        address.addressLocality,
+    );
+};
+
+const getIdentifierValue = (identifier) => {
+    if (!identifier) return null;
+    if (typeof identifier === 'string') return identifier;
+    if (typeof identifier === 'object') return identifier.value || identifier['@id'] || null;
+    return null;
 };
 
 const normalizeBaseSalary = (baseSalary) => {
     if (!baseSalary) return null;
-    if (typeof baseSalary === 'string') return baseSalary;
+    if (typeof baseSalary === 'string') return baseSalary.trim() || null;
 
-    const currency = baseSalary.currency || baseSalary?.value?.currency || null;
-    const unitText = baseSalary?.value?.unitText || null;
     const { value } = baseSalary;
+    const currency = baseSalary.currency || value?.currency || null;
+    const unitText = value?.unitText || null;
 
     if (value && typeof value === 'object') {
-        return {
-            currency,
-            unitText,
-            minValue: value.minValue ?? null,
-            maxValue: value.maxValue ?? null,
-            value: value.value ?? null,
+        const normalized = {
+            currency: currency || null,
+            unitText: unitText || null,
+            minValue: value.minValue === '' ? null : (value.minValue ?? null),
+            maxValue: value.maxValue === '' ? null : (value.maxValue ?? null),
+            value: value.value === '' ? null : (value.value ?? null),
         };
+        const hasValue = [normalized.currency, normalized.minValue, normalized.maxValue, normalized.value]
+            .some((entry) => entry !== null && entry !== undefined && entry !== '');
+        return hasValue ? normalized : null;
     }
 
-    return {
-        currency,
-        unitText,
-        value,
-    };
+    return value === '' || value === undefined ? null : { currency, unitText, value };
 };
 
 const removeNullValues = (value) => {
     if (value === null || value === undefined) return undefined;
+    if (typeof value === 'string' && value.trim() === '') return undefined;
 
     if (Array.isArray(value)) {
         const cleaned = value
@@ -243,106 +259,340 @@ const removeNullValues = (value) => {
 
     if (typeof value === 'object') {
         const cleanedEntries = Object.entries(value)
-            .map(([key, val]) => [key, removeNullValues(val)])
-            .filter(([, val]) => val !== undefined);
+            .map(([key, entry]) => [key, removeNullValues(entry)])
+            .filter(([, entry]) => entry !== undefined);
         return cleanedEntries.length ? Object.fromEntries(cleanedEntries) : undefined;
     }
 
     return value;
 };
 
-const getJobLocationText = (jobPosting) => {
-    const loc = Array.isArray(jobPosting?.jobLocation) ? jobPosting.jobLocation[0] : jobPosting?.jobLocation;
-    const addr = loc?.address;
-    if (!addr) return null;
-    return [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean).join(', ') || null;
+const sanitizeJsonString = (raw) => {
+    const input = String(raw);
+    let out = '';
+    let inString = false;
+    let escapeNext = false;
+
+    for (const character of input) {
+        if (escapeNext) {
+            out += character;
+            escapeNext = false;
+            continue;
+        }
+        if (inString && character === '\\') {
+            out += character;
+            escapeNext = true;
+            continue;
+        }
+        if (character === '"') {
+            out += character;
+            inString = !inString;
+            continue;
+        }
+        if (inString) {
+            const code = character.codePointAt(0);
+            if (character === '\n') {
+                out += '\\n';
+                continue;
+            }
+            if (character === '\r') {
+                out += '\\r';
+                continue;
+            }
+            if (character === '\t') {
+                out += '\\t';
+                continue;
+            }
+            if (character === '\f') {
+                out += '\\f';
+                continue;
+            }
+            if (character === '\b') {
+                out += '\\b';
+                continue;
+            }
+            if (code < 0x20) {
+                out += ' ';
+                continue;
+            }
+        }
+        out += character;
+    }
+
+    return out;
 };
 
-const getIdentifierValue = (identifier) => {
-    if (!identifier) return null;
-    if (typeof identifier === 'string') return identifier;
-    if (typeof identifier === 'object') return identifier.value || identifier['@id'] || null;
+const salvageJobPosting = (raw) => {
+    const readString = (key) => {
+        const match = String(raw).match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+        if (!match) return null;
+        try {
+            return JSON.parse(`"${match[1]}"`);
+        } catch {
+            return match[1];
+        }
+    };
+
+    return {
+        '@type': 'JobPosting',
+        title: readString('title'),
+        datePosted: readString('datePosted'),
+        employmentType: readString('employmentType'),
+        industry: readString('industry'),
+        description: readString('description'),
+        additionalType: readString('additionalType'),
+        url: readString('url'),
+    };
+};
+
+const parseJsonLdBlocks = (html) => {
+    const blocks = [...String(html).matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
+        .map((match) => match[1]);
+    const parsed = [];
+
+    for (const block of blocks) {
+        const trimmed = block.replace(/^\uFEFF/, '').trim();
+        if (!trimmed) continue;
+        let succeeded = false;
+        for (const candidate of [trimmed, sanitizeJsonString(trimmed)]) {
+            try {
+                parsed.push(JSON.parse(candidate));
+                succeeded = true;
+                break;
+            } catch {
+                // Try the sanitized variant, then fall back to the salvage path.
+            }
+        }
+        if (!succeeded) {
+            const salvaged = salvageJobPosting(trimmed);
+            if (salvaged.title || salvaged.description) parsed.push(salvaged);
+        }
+    }
+
+    return parsed;
+};
+
+const findJobPosting = (value, depth = 0) => {
+    if (!value || depth > 8) return null;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = findJobPosting(item, depth + 1);
+            if (found) return found;
+        }
+        return null;
+    }
+    if (typeof value !== 'object') return null;
+    if (value['@type'] === 'JobPosting') return value;
+    for (const key of ['@graph', 'itemListElement', 'item', 'mainEntity']) {
+        if (value[key]) {
+            const found = findJobPosting(value[key], depth + 1);
+            if (found) return found;
+        }
+    }
     return null;
 };
 
-const pushBatch = async (items, savedCount) => {
-    if (!items.length) return savedCount;
-    await Dataset.pushData(items);
-    const nextSavedCount = savedCount + items.length;
-    log.warning('Detail data push', { batchSize: items.length, totalSaved: nextSavedCount });
-    return nextSavedCount;
+const findTile = (html, path) => {
+    const index = html.indexOf(path);
+    if (index === -1) return '';
+
+    const forwardClass = html.indexOf('job-tile', index);
+    const backwardClass = html.lastIndexOf('job-tile', index);
+    const tileClass = forwardClass !== -1 && forwardClass - index < 600
+        ? forwardClass
+        : backwardClass;
+
+    if (tileClass === -1) {
+        return html.slice(Math.max(0, index - 2500), Math.min(html.length, index + 8000));
+    }
+
+    const start = Math.max(0, html.lastIndexOf('<div', tileClass));
+    const openTagEnd = html.indexOf('>', tileClass);
+    const nextClass = openTagEnd === -1 ? -1 : html.indexOf('job-tile', openTagEnd + 1);
+    const end = nextClass === -1
+        ? Math.min(html.length, start + 12000)
+        : Math.max(start, html.lastIndexOf('<div', nextClass));
+    return html.slice(start, end);
 };
 
-const fetchListingPage = async ({ pageUrl, proxyConf }) => {
-    const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
-    const { body } = await gotScraping({
-        url: pageUrl,
-        method: 'GET',
-        headers: {
-            'user-agent': USER_AGENT,
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'en-US,en;q=0.9',
-        },
-        proxyUrl,
-        timeout: {
-            request: 60000,
-        },
-        retry: {
-            limit: 2,
-        },
-    });
-    return body;
+const extractListingJobs = (html, pageUrl) => {
+    const jobs = [];
+    const seen = new Set();
+    const linkPattern = /\b(?:about|href)=["']([^"']*?\/job-detail\/[^"']*)["']/gi;
+
+    for (const match of String(html).matchAll(linkPattern)) {
+        const rawPath = decodeEntities(match[1]);
+        if (!rawPath) continue;
+
+        let url;
+        try {
+            url = new URL(rawPath, pageUrl).href;
+        } catch {
+            continue;
+        }
+
+        const key = jobKeyFromUrl(url);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+
+        const tile = findTile(html, match[1]);
+        const titleBlock = readBlock(tile, 'job-title');
+        const bulletBlock = readBlock(tile, 'job_advert__job-desc-bullet-points');
+        const title = firstText(
+            stripTags(titleBlock.match(/<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)?.[1] || ''),
+            stripTags(titleBlock),
+            stripTags(readBlock(tile, 'job-apply-job-title')),
+        );
+        const listingJobId = tile.match(/id=["']job-(\d+)["']/i)?.[1]
+            || tile.match(/class=["'][^"']*job-title[^"']*["'][^>]*id=["'](\d+)["']/i)?.[1]
+            || null;
+        const bulletPoints = [...bulletBlock.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)]
+            .map((entry) => stripTags(entry[1]))
+            .filter(Boolean);
+
+        jobs.push({
+            key,
+            url,
+            referer: pageUrl,
+            title: title || null,
+            location: firstText(stripTags(readBlock(tile, 'job-location'))),
+            salary: firstText(stripTags(readBlock(tile, 'job-salary'))),
+            job_type: firstText(stripTags(readBlock(tile, 'job-contract-type'))),
+            job_nature: firstText(stripTags(readBlock(tile, 'job-nature'))),
+            company_type: firstText(stripTags(readBlock(tile, 'job-company-type'))),
+            sector: firstText(stripTags(readBlock(tile, 'job-sector'))),
+            summary: firstText(stripTags(readBlock(tile, 'job_advert__job-summary-text'))),
+            bullet_points: bulletPoints.length ? bulletPoints : null,
+            listing_job_id: listingJobId,
+            job_reference: getJobReferenceFromUrl(url),
+        });
+    }
+
+    return jobs;
 };
 
-const fetchDetailRecord = async ({ detailUrl, listing, proxyConf }) => {
-    const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
-    const { body } = await gotScraping({
-        url: detailUrl,
-        method: 'GET',
-        headers: {
-            'user-agent': USER_AGENT,
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'en-US,en;q=0.9',
-            referer: `${BASE_URL}/jobs`,
-        },
-        proxyUrl,
-        timeout: {
-            request: 60000,
-        },
-        retry: {
-            limit: 2,
-        },
-    });
+const parseSummaryFields = (html) => {
+    const pairs = [...String(html).matchAll(/<dt[^>]*>([\s\S]*?)<\/dt>\s*<dd[^>]*>([\s\S]*?)<\/dd>/gi)]
+        .map((match) => [stripTags(match[1]), stripTags(match[2])])
+        .filter(([label]) => label);
+    const indexOfLabel = (pattern) => pairs.findIndex(([label]) => pattern.test(label));
+    const valueAt = (index) => (index >= 0 ? pairs[index][1] || null : null);
 
-    const jobPosting = extractJobPostingJsonLd(body);
-    const descriptionHtml = jobPosting?.description || null;
-    const jobLocation = getJobLocationText(jobPosting);
-    const jobId = getIdentifierValue(jobPosting?.identifier);
-    const employmentType = Array.isArray(jobPosting?.employmentType)
-        ? jobPosting.employmentType.join(', ')
-        : (jobPosting?.employmentType || null);
+    const sectorIndex = indexOfLabel(/^(sector|secteur|branche|settore|sektor|setor|セクター|行业)/i);
+    const subSectorIndex = indexOfLabel(/^(sub\s*sector|sous[\s-]*secteur|sottosettore|subsektor|subsector|teilbranche|サブセクター|子行业)/i);
 
-    const data = {
-        title: listing.title || jobPosting?.title || jobPosting?.name || null,
-        company: listing.company || jobPosting?.hiringOrganization?.name || null,
-        location: listing.location || jobLocation || null,
-        salary: listing.salary || null,
-        job_type: listing.job_type || employmentType || null,
-        job_nature: listing.job_nature || null,
-        sector: listing.sector || null,
-        industry: listing.industry || jobPosting?.industry || null,
-        date_posted: listing.date_posted || jobPosting?.datePosted || null,
+    return {
+        sector: sectorIndex >= 0 ? valueAt(sectorIndex) : valueAt(0),
+        subSector: subSectorIndex >= 0 ? valueAt(subSectorIndex) : valueAt(1),
+        industry: valueAt(indexOfLabel(/^(industry|industrie|industria|業界|indústria)/i)),
+        contractType: valueAt(indexOfLabel(/^(contract type|type de contrat|vertragsart|tipo di contratto|tipo de contrato|contracttype|合同类型|雇用形態)/i)),
+        consultant: valueAt(indexOfLabel(/consultant|consultor|consulente|berater|コンサルタント|顾问/i)),
+        jobReference: valueAt(indexOfLabel(/référence|reference|referenz|referencia|referência|referentie|求人番号|职位编号|職位編號/i)),
+    };
+};
+
+const parseContactFields = (html) => {
+    const start = String(html).indexOf('job-contact-info');
+    if (start === -1) return { consultant: null, jobReference: null };
+    const block = String(html).slice(start, start + 4000);
+    const pairs = [...block.matchAll(/<div[^>]*class=["'][^"']*field--label[^"']*["'][^>]*>([\s\S]*?)<\/div>\s*<div[^>]*class=["'][^"']*field--item[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)]
+        .map((match) => [stripTags(match[1]), stripTags(match[2])])
+        .filter(([label, value]) => label && value);
+
+    return {
+        consultant: pairs.find(([label]) => /contact|kontakt|consultant|consultor|consulente|berater|コンサルタント|顾问|联系人/i.test(label))?.[1]
+            || pairs[0]?.[1]
+            || null,
+        jobReference: pairs.find(([label]) => /ref|réf|referenz|referencia|referência|referentie|求人番号|职位编号|職位編號/i.test(label))?.[1] || null,
+    };
+};
+
+const parseDetailHtml = (html) => {
+    const header = readBlock(html, 'job-apply-fields') || html;
+    const sections = [
+        ['About Our Client', readBlock(html, 'job_advert__job-desc-company')],
+        ['Job Description', readBlock(html, 'job_advert__job-desc-role')],
+        ['The Successful Applicant', readBlock(html, 'job_advert__job-desc-candidate')],
+        ["What's on Offer", readBlock(html, 'job_advert__job-desc-deal')],
+    ].filter(([, content]) => stripTags(content));
+    const descriptionHtml = sections.length
+        ? sections.map(([heading, content]) => `<h2>${heading}</h2>${content}`).join('\n')
+        : null;
+    const contact = parseContactFields(html);
+    const summary = parseSummaryFields(html);
+    const applyPath = html.match(/href=["']([^"']*\/job-apply\/[^"']+)["']/i)?.[1] || null;
+
+    return {
+        title: firstText(stripTags(readBlock(html, 'job-apply-job-title')), stripTags(readBlock(html, 'job-title'))),
+        location: firstText(stripTags(readBlock(header, 'job-location'))),
+        salary: firstText(stripTags(readBlock(header, 'job-salary'))),
+        contractType: firstText(stripTags(readBlock(header, 'job-contract-type')), summary.contractType),
+        companyType: firstText(stripTags(readBlock(header, 'job-company-type'))),
+        jobNature: firstText(stripTags(readBlock(header, 'job-nature'))),
+        descriptionHtml,
+        applyUrl: applyPath,
+        consultant: firstText(contact.consultant, summary.consultant),
+        jobReference: firstText(contact.jobReference, summary.jobReference),
+        sector: summary.sector,
+        subSector: summary.subSector,
+        industry: summary.industry,
+    };
+};
+
+const buildRecord = ({ listing, detailUrl, html }) => {
+    let jobPosting = null;
+    let extras = EMPTY_DETAIL;
+
+    if (html) {
+        try {
+            jobPosting = findJobPosting(parseJsonLdBlocks(html));
+            extras = parseDetailHtml(html);
+        } catch (error) {
+            log.warning(`Detail parsing fell back to listing fields for ${jobKeyFromUrl(detailUrl)}: ${error.message}`);
+        }
+    }
+
+    let origin = null;
+    try {
+        origin = new URL(detailUrl).origin;
+    } catch {
+        origin = null;
+    }
+
+    const employmentType = jobPosting?.employmentType ?? null;
+    const employmentText = Array.isArray(employmentType) ? employmentType.join(', ') : employmentType;
+    const descriptionHtml = firstText(jobPosting?.description, extras.descriptionHtml);
+    const applyUrl = extras.applyUrl && origin
+        ? new URL(extras.applyUrl, detailUrl).href
+        : extras.applyUrl;
+
+    const record = {
+        title: firstText(listing.title, jobPosting?.title, extras.title),
+        company: firstText(jobPosting?.hiringOrganization?.name),
+        location: firstText(formatJobLocation(jobPosting?.jobLocation), listing.location, extras.location),
+        salary: firstText(listing.salary, extras.salary),
+        job_type: firstText(listing.job_type, extras.contractType, employmentText),
+        job_nature: firstText(listing.job_nature, extras.jobNature),
+        company_type: firstText(listing.company_type, extras.companyType),
+        sector: firstText(listing.sector, extras.sector),
+        sub_sector: extras.subSector,
+        industry: firstText(jobPosting?.industry, extras.industry),
+        date_posted: jobPosting?.datePosted || null,
         description_html: descriptionHtml,
-        description_text: cleanText(descriptionHtml || ''),
+        description_text: descriptionHtml ? stripTags(descriptionHtml) : null,
         url: detailUrl,
+        apply_url: applyUrl,
         scrapedAt: new Date().toISOString(),
         listing_job_id: listing.listing_job_id || null,
-        job_id: jobId || null,
+        job_id: getIdentifierValue(jobPosting?.identifier),
+        job_reference: firstText(extras.jobReference, listing.job_reference, getJobReferenceFromUrl(detailUrl)),
         additional_type: jobPosting?.additionalType || null,
-        employment_type: jobPosting?.employmentType || null,
+        employment_type: employmentType,
         valid_through: jobPosting?.validThrough || null,
         direct_apply: typeof jobPosting?.directApply === 'boolean' ? jobPosting.directApply : null,
-        job_location: jobPosting?.jobLocation || null,
+        job_location: jobPosting?.jobLocation ?? null,
+        job_location_type: jobPosting?.jobLocationType || null,
+        applicant_location_requirements: jobPosting?.applicantLocationRequirements ?? null,
         base_salary: normalizeBaseSalary(jobPosting?.baseSalary),
         job_benefits: jobPosting?.jobBenefits || null,
         occupational_category: jobPosting?.occupationalCategory || null,
@@ -354,118 +604,634 @@ const fetchDetailRecord = async ({ detailUrl, listing, proxyConf }) => {
         work_hours: jobPosting?.workHours || null,
         hiring_organization: jobPosting?.hiringOrganization || null,
         identifier: jobPosting?.identifier || null,
+        consultant: extras.consultant,
         summary: listing.summary || null,
         bullet_points: listing.bullet_points || null,
+        source_domain: origin ? new URL(origin).host : null,
     };
 
-    return removeNullValues(data) || null;
+    return removeNullValues(record) || null;
 };
 
-async function main() {
-    const input = (await Actor.getInput()) || {};
-    const {
-        keyword = '',
-        location = '',
-        results_wanted: resultsWantedRaw = 20,
-        max_pages: maxPagesRaw = 10,
-        startUrl,
-        startUrls,
-        url,
-        proxyConfiguration,
-    } = input;
+const createHttpError = (message, options = {}) => {
+    const error = new Error(message);
+    error.name = 'HttpError';
+    error.status = options.status || 0;
+    error.noResults = Boolean(options.noResults);
+    error.closed = Boolean(options.closed);
+    error.isHttpError = true;
+    return error;
+};
 
-    const RESULTS_WANTED = Number.isFinite(+resultsWantedRaw)
-        ? Math.max(1, +resultsWantedRaw)
-        : Number.MAX_SAFE_INTEGER;
-    const MAX_PAGES = Number.isFinite(+maxPagesRaw)
-        ? Math.max(1, +maxPagesRaw)
-        : 999;
-
-    const initial = [];
-    if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-    if (startUrl) initial.push(startUrl);
-    if (url) initial.push(url);
-    if (!initial.length) initial.push(buildStartUrl(keyword, location));
-    const listingUrl = initial[0];
-
-    let proxyConf;
-    try {
-        proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-            : await Actor.createProxyConfiguration({
-                useApifyProxy: true,
-                apifyProxyGroups: ['RESIDENTIAL'],
-            });
-    } catch (err) {
-        log.warning(`Proxy configuration failed: ${err.message}`);
-        proxyConf = undefined;
+class RequestPool {
+    constructor({ proxyConfiguration, size, minPaceMs, maxPaceMs }) {
+        this.proxyConfiguration = proxyConfiguration;
+        this.size = Math.max(1, size);
+        this.minPaceMs = minPaceMs;
+        this.maxPaceMs = maxPaceMs;
+        this.slots = [];
+        this.cursor = 0;
+        this.profileCursor = 0;
+        this.runTag = Date.now().toString(36);
     }
 
-    const foundByUrl = new Map();
-    const orderedUrls = [];
-
-    for (let pageNo = 0; pageNo < MAX_PAGES && orderedUrls.length < RESULTS_WANTED; pageNo++) {
-        const pageUrl = buildPagedUrl(listingUrl, pageNo);
-        const listingHtml = await fetchListingPage({ pageUrl, proxyConf });
-        const jobs = extractJobsFromListingHtml(listingHtml);
-        if (!jobs.length) break;
-
-        let newOnPage = 0;
-        for (const job of jobs) {
-            if (!job?.url || foundByUrl.has(job.url)) continue;
-            foundByUrl.set(job.url, job);
-            orderedUrls.push(job.url);
-            newOnPage++;
-            if (orderedUrls.length >= RESULTS_WANTED) break;
+    async init() {
+        for (let index = 0; index < this.size; index += 1) {
+            this.slots.push(await this.createSlot(index, 0, this.minPaceMs));
         }
-
-        if (!newOnPage) break;
+        if (this.proxyConfiguration && this.slots.some((slot) => !slot.proxyUrl)) {
+            throw new Error('Apify Proxy session could not be created. Check proxy access and try again.');
+        }
     }
 
-    if (!orderedUrls.length) return;
-
-    const detailUrls = orderedUrls.slice(0, RESULTS_WANTED);
-    let savedCount = 0;
-    const pushBuffer = [];
-
-    for (let i = 0; i < detailUrls.length; i += DETAIL_CONCURRENCY) {
-        const chunk = detailUrls.slice(i, i + DETAIL_CONCURRENCY);
-        const settled = await Promise.allSettled(
-            chunk.map(async (detailUrl) => {
-                const listing = foundByUrl.get(detailUrl) || {};
-                try {
-                    return await fetchDetailRecord({ detailUrl, listing, proxyConf });
-                } catch {
-                    const fallback = removeNullValues({
-                        ...listing,
-                        url: detailUrl,
-                        scrapedAt: new Date().toISOString(),
-                    });
-                    return fallback || null;
-                }
+    async createSlot(index, attempt, pacingMs) {
+        const profile = PROFILE_POOL[this.profileCursor % PROFILE_POOL.length];
+        this.profileCursor += 1;
+        let proxyUrl;
+        if (this.proxyConfiguration) {
+            try {
+                proxyUrl = await this.proxyConfiguration.newUrl(`mp_${this.runTag}_${index}_${attempt}`);
+            } catch (error) {
+                log.warning(`Proxy session could not be created: ${error.message}`);
+            }
+        }
+        return {
+            index,
+            attempt,
+            profile,
+            proxyUrl,
+            pacingMs: Math.max(this.minPaceMs, Math.min(this.maxPaceMs, pacingMs)),
+            nextSlotAt: 0,
+            client: new Impit({
+                browser: profile,
+                timeout: REQUEST_TIMEOUT_MS,
+                followRedirects: false,
+                ...(proxyUrl ? { proxyUrl } : {}),
             }),
-        );
+        };
+    }
 
-        for (const result of settled) {
-            if (result.status !== 'fulfilled' || !result.value) continue;
-            pushBuffer.push(result.value);
-            if (pushBuffer.length >= PUSH_BATCH_SIZE) {
-                savedCount = await pushBatch(pushBuffer, savedCount);
-                pushBuffer.length = 0;
+    nextSlot() {
+        const slot = this.slots[this.cursor % this.slots.length];
+        this.cursor += 1;
+        return slot;
+    }
+
+    async rotateSlot(slot) {
+        const next = await this.createSlot(slot.index, slot.attempt + 1, slot.pacingMs);
+        if (this.proxyConfiguration && !next.proxyUrl) {
+            log.warning('Proxy session rotation failed; keeping the current session.');
+            return slot;
+        }
+        this.slots[slot.index] = next;
+        return next;
+    }
+
+    async rotateAll() {
+        for (let index = 0; index < this.slots.length; index += 1) {
+            const current = this.slots[index];
+            const next = await this.createSlot(index, current.attempt + 1, current.pacingMs);
+            if (!this.proxyConfiguration || next.proxyUrl) this.slots[index] = next;
+        }
+    }
+
+    async pace(slot) {
+        const now = Date.now();
+        const at = Math.max(now, slot.nextSlotAt);
+        const nextSlotAt = at + slot.pacingMs + Math.floor(Math.random() * slot.pacingMs * 0.4);
+        const next = { ...slot, nextSlotAt };
+        this.slots[slot.index] = next;
+        const wait = at - now;
+        if (wait > 0) await sleep(wait);
+        return next;
+    }
+
+    setPacing(slot, pacingMs) {
+        const next = { ...slot, pacingMs };
+        this.slots[slot.index] = next;
+        return next;
+    }
+
+    noteThrottle(slot) {
+        return this.setPacing(slot, Math.min(this.maxPaceMs, Math.round(slot.pacingMs * 1.7)));
+    }
+
+    noteSuccess(slot) {
+        return this.setPacing(slot, Math.max(this.minPaceMs, Math.round(slot.pacingMs * 0.9)));
+    }
+
+    retryDelay(attempt, headers) {
+        const retryAfter = parseRetryAfter(headers);
+        if (retryAfter !== null) return Math.min(retryAfter, MAX_RETRY_DELAY_MS);
+        const backoff = BASE_RETRY_DELAY_MS * (2 ** (attempt - 1));
+        return Math.min(MAX_RETRY_DELAY_MS, backoff + Math.floor(Math.random() * 500));
+    }
+
+    async requestOnce(slot, url, headers) {
+        const response = await slot.client.fetch(url, {
+            headers,
+            timeout: REQUEST_TIMEOUT_MS,
+            redirect: 'manual',
+        });
+        const body = await response.text();
+        return {
+            body,
+            status: response.status,
+            url: response.url || url,
+            headers: response.headers,
+        };
+    }
+
+    getRedirectTarget(result, currentUrl) {
+        let target = getHeader(result.headers, 'location');
+        if (!target) {
+            const meta = result.body.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["']([^"']+)["']/i)?.[1];
+            target = meta?.match(/url\s*=\s*['"]?([^'"]+)['"]?/i)?.[1] || null;
+        }
+        if (!target) return null;
+        try {
+            const next = new URL(decodeEntities(target.trim()), currentUrl).href;
+            return /^https?:/i.test(next) ? next : null;
+        } catch {
+            return null;
+        }
+    }
+
+    async requestFollowingRedirects(slot, url, headers) {
+        let current = url;
+        for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+            const result = await this.requestOnce(slot, current, headers);
+            if (result.status >= 300 && result.status < 400) {
+                const target = this.getRedirectTarget(result, current);
+                if (target && target !== current) {
+                    current = target;
+                    continue;
+                }
+            }
+            return result;
+        }
+        throw createHttpError(`Too many redirects for ${url}`, { status: 508 });
+    }
+
+    async fetchHtml(url, options = {}) {
+        const { referer, kind = 'page' } = options;
+        const headers = referer ? { referer } : undefined;
+        let slot = this.nextSlot();
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+            slot = await this.pace(slot);
+            try {
+                const result = await this.requestFollowingRedirects(slot, url, headers);
+                const { status, body } = result;
+
+                if (isClosedOffice(body)) {
+                    throw createHttpError('This market is closed. Choose a different Michael Page country site.', { status, closed: true });
+                }
+
+                if (isChallenge(status, body)) {
+                    lastError = createHttpError(`Blocked by the site (HTTP ${status})`, { status });
+                    if (attempt < MAX_ATTEMPTS) {
+                        log.warning(`Request challenged (HTTP ${status}, profile ${slot.profile}); rotating session and backing off.`);
+                        slot = this.noteThrottle(slot);
+                        slot = await this.rotateSlot(slot);
+                        await sleep(this.retryDelay(attempt, result.headers));
+                        continue;
+                    }
+                    break;
+                }
+
+                if (status === 404 && isNoResultsHtml(body)) {
+                    throw createHttpError('No results for this search', { status, noResults: true });
+                }
+
+                if (status >= 300 && status < 400) {
+                    lastError = createHttpError(`Unresolved redirect (HTTP ${status})`, { status });
+                    if (attempt < MAX_ATTEMPTS) {
+                        log.warning(`Redirect could not be resolved (HTTP ${status}); retrying with a fresh session.`);
+                        slot = await this.rotateSlot(slot);
+                        await sleep(this.retryDelay(attempt, result.headers));
+                        continue;
+                    }
+                    break;
+                }
+
+                if (isRetryableStatus(status)) {
+                    lastError = createHttpError(`HTTP ${status} from the site`, { status });
+                    if (attempt < MAX_ATTEMPTS) {
+                        log.warning(`Request returned HTTP ${status}; retrying with a fresh session.`);
+                        slot = this.noteThrottle(slot);
+                        slot = await this.rotateSlot(slot);
+                        await sleep(this.retryDelay(attempt, result.headers));
+                        continue;
+                    }
+                    break;
+                }
+
+                if (status < 200 || status >= 400) {
+                    throw createHttpError(`HTTP ${status} from the site`, { status });
+                }
+
+                if (kind === 'detail' && !looksLikeDetail(body)) {
+                    lastError = createHttpError('Detail page returned no job markers', { status });
+                    if (attempt < MAX_ATTEMPTS) {
+                        log.warning('Detail page returned no job markers; retrying with a fresh session.');
+                        slot = await this.rotateSlot(slot);
+                        await sleep(this.retryDelay(attempt, result.headers));
+                        continue;
+                    }
+                    break;
+                }
+
+                slot = this.noteSuccess(slot);
+                return {
+                    body,
+                    status,
+                    url: result.url,
+                    profile: slot.profile,
+                    pacingMs: slot.pacingMs,
+                };
+            } catch (error) {
+                if (error.isHttpError && (error.noResults || error.closed)) throw error;
+                lastError = error;
+                if (attempt >= MAX_ATTEMPTS) break;
+                log.warning(`Request failed (${error.message}); retrying.`);
+                slot = this.noteThrottle(slot);
+                slot = await this.rotateSlot(slot);
+                await sleep(this.retryDelay(attempt));
             }
         }
 
-        if (pushBuffer.length) {
-            savedCount = await pushBatch(pushBuffer, savedCount);
-            pushBuffer.length = 0;
-        }
+        throw lastError.isHttpError
+            ? lastError
+            : createHttpError(lastError?.message || 'Request failed');
     }
 }
 
+const getMarketCountry = (value) => {
+    const raw = normalizeText(value);
+    if (!raw) return null;
+    try {
+        const host = new URL(raw.includes('://') ? raw : `https://${raw}`).host.toLowerCase();
+        return MARKET_COUNTRIES[host] || null;
+    } catch {
+        return null;
+    }
+};
+
+const normalizeDomain = (value) => {
+    const raw = normalizeText(value);
+    if (!raw) return DEFAULT_DOMAIN;
+    const host = raw
+        .replace(/^https?:\/\//i, '')
+        .replace(/\/.*$/, '')
+        .toLowerCase();
+    const withWww = host.startsWith('www.') ? host : `www.${host}`;
+    if (!DOMAINS.includes(withWww)) {
+        throw new Error(`Unsupported Michael Page market "${raw}". Use one of: ${DOMAINS.join(', ')}`);
+    }
+    return withWww;
+};
+
+const slugify = (value) => normalizeText(value)
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+const buildSearchUrl = (domain, keyword, location) => {
+    const url = new URL(`https://${domain}/jobs`);
+    if (keyword) url.searchParams.set('search', keyword);
+    if (location) url.searchParams.set('location', location);
+    return url.href;
+};
+
+const buildPrettyUrl = (domain, keyword, location) => {
+    const keywordSlug = slugify(keyword);
+    if (!keywordSlug) return null;
+    const locationSlug = location ? slugify(location) : '';
+    return `https://${domain}/jobs/${keywordSlug}${locationSlug ? `/${locationSlug}` : ''}`;
+};
+
+const dedupeUrls = (urls) => [...new Set(urls.filter(Boolean))];
+
+const buildSearchCandidates = ({ startUrl, keyword, location, domain }) => {
+    if (startUrl) {
+        const candidates = [startUrl];
+        try {
+            const parsed = new URL(startUrl);
+            const search = parsed.searchParams.get('search');
+            if (search && !/\/job-detail\//i.test(parsed.pathname)) {
+                const alternate = new URL(`https://${parsed.host}/jobs`);
+                alternate.searchParams.set('search', search);
+                const alternateLocation = parsed.searchParams.get('location');
+                if (alternateLocation) alternate.searchParams.set('location', alternateLocation);
+                candidates.push(alternate.href);
+            }
+        } catch {
+            throw new Error(`Invalid startUrl: ${startUrl}`);
+        }
+        return dedupeUrls(candidates);
+    }
+
+    const candidates = [buildSearchUrl(domain, keyword, location)];
+    if (keyword) candidates.push(buildPrettyUrl(domain, keyword, location));
+    return dedupeUrls(candidates);
+};
+
+const withPage = (url, page) => {
+    const parsed = new URL(url);
+    if (page > 0) parsed.searchParams.set('page', String(page));
+    else parsed.searchParams.delete('page');
+    return parsed.href;
+};
+
+const hasNextPage = (html) => /rel=["']next["']/i.test(String(html));
+
+const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWanted }) => {
+    let sawNoResults = false;
+    let lastReason = 'not_attempted';
+
+    const fetchPage = async (candidate, page) => {
+        const pageUrl = withPage(candidate, page);
+        try {
+            const response = await fetcher.fetchHtml(pageUrl, { kind: 'listing', referer });
+            return { page, pageUrl, html: response.body };
+        } catch (error) {
+            return { page, pageUrl, error };
+        }
+    };
+
+    for (const candidate of candidates) {
+        const first = await fetchPage(candidate, 0);
+        if (first.error) {
+            if (first.error.noResults) {
+                sawNoResults = true;
+                lastReason = 'no_results';
+                continue;
+            }
+            lastReason = first.error.message;
+            continue;
+        }
+        const firstJobs = extractListingJobs(first.html, first.pageUrl);
+        if (!firstJobs.length) {
+            if (isNoResultsHtml(first.html)) sawNoResults = true;
+            lastReason = sawNoResults ? 'no_results' : 'no_job_rows';
+            continue;
+        }
+
+        const pageResults = [first];
+        const observedPageSize = Math.max(1, firstJobs.length);
+        const pagesToTry = resultsWanted <= firstJobs.length
+            ? 1
+            : Math.min(maxPages, Math.ceil(resultsWanted / observedPageSize) + 1);
+        const parallelListing = fetcher.size > 1 && pagesToTry > 1 && hasNextPage(first.html);
+        let stopReason = 'max_pages';
+
+        if (parallelListing) {
+            const requests = [];
+            for (let page = 1; page < pagesToTry; page += 1) requests.push(fetchPage(candidate, page));
+            const settled = await Promise.all(requests);
+            pageResults.push(...settled);
+        } else {
+            for (let page = 1; page < pagesToTry; page += 1) {
+                if (!hasNextPage(pageResults[pageResults.length - 1].html)) {
+                    stopReason = 'last_page';
+                    break;
+                }
+                const result = await fetchPage(candidate, page);
+                pageResults.push(result);
+                if (result.error) {
+                    if (result.error.noResults) {
+                        sawNoResults = true;
+                        stopReason = 'no_results';
+                        break;
+                    }
+                    log.warning(`Listing page ${page + 1} failed (${result.error.message}); stopping pagination.`);
+                    stopReason = 'page_error';
+                    break;
+                }
+                if (!extractListingJobs(result.html, result.pageUrl).length) {
+                    stopReason = 'no_job_rows';
+                    break;
+                }
+            }
+        }
+
+        const jobs = [];
+        const seen = new Set();
+        let pagesWithJobs = 0;
+
+        for (const result of pageResults) {
+            if (result.error) {
+                if (result.error.noResults) sawNoResults = true;
+                continue;
+            }
+            const parsedJobs = extractListingJobs(result.html, result.pageUrl);
+            if (!parsedJobs.length) continue;
+            pagesWithJobs += 1;
+            for (const job of parsedJobs) {
+                if (seen.has(job.key)) continue;
+                seen.add(job.key);
+                jobs.push(job);
+                if (jobs.length >= resultsWanted) break;
+            }
+            if (jobs.length >= resultsWanted) break;
+        }
+
+        if (jobs.length) {
+            return { jobs, pages: pagesWithJobs, reason: stopReason, noResults: false };
+        }
+        lastReason = sawNoResults ? 'no_results' : stopReason;
+    }
+
+    return { jobs: [], pages: 0, reason: lastReason, noResults: sawNoResults };
+};
+
+const createProxyConfiguration = async (proxyInput) => {
+    const hasCustomUrls = Array.isArray(proxyInput?.proxyUrls) && proxyInput.proxyUrls.length > 0;
+    const wantsApifyProxy = Boolean(proxyInput?.useApifyProxy);
+    if (!hasCustomUrls && !(wantsApifyProxy && Actor.isAtHome())) return undefined;
+
+    try {
+        return await Actor.createProxyConfiguration(proxyInput);
+    } catch (error) {
+        log.warning(`Proxy configuration could not be created: ${error.message}. Continuing without a proxy.`);
+        return undefined;
+    }
+};
+
+const main = async () => {
+    const input = (await Actor.getInput()) || {};
+    const keyword = normalizeText(input.keyword);
+    const location = normalizeText(input.location);
+    const startUrl = normalizeText(input.startUrl);
+    const domain = startUrl ? DEFAULT_DOMAIN : normalizeDomain(input.domain);
+    const resultsWanted = normalizePositiveInt(input.results_wanted, 20);
+    const maxPages = Math.min(normalizePositiveInt(input.max_pages, 10), MAX_PAGES_HARD_LIMIT);
+
+    const maxConcurrency = Math.min(
+        normalizePositiveInt(input.maxConcurrency, DEFAULT_DETAIL_CONCURRENCY),
+        MAX_DETAIL_CONCURRENCY,
+    );
+    const includeJobDetails = input.includeJobDetails !== false;
+    const proxyInput = { ...(input.proxyConfiguration || {}) };
+    if (proxyInput.useApifyProxy && !proxyInput.apifyProxyCountry) {
+        const country = getMarketCountry(startUrl || domain);
+        if (country) proxyInput.apifyProxyCountry = country;
+    }
+    const proxyConfiguration = await createProxyConfiguration(proxyInput);
+    const poolSize = proxyConfiguration
+        ? Math.max(1, Math.min(PROXY_POOL_MAX, Math.ceil(maxConcurrency / 2)))
+        : 1;
+    const fetcher = new RequestPool({
+        proxyConfiguration,
+        size: poolSize,
+        minPaceMs: proxyConfiguration ? PACE_MIN_PROXY_MS : PACE_MIN_DIRECT_MS,
+        maxPaceMs: proxyConfiguration ? PACE_MAX_PROXY_MS : PACE_MAX_DIRECT_MS,
+    });
+    await fetcher.init();
+
+    if (startUrl && /\/job-detail\//i.test(startUrl)) {
+        const response = await fetcher.fetchHtml(startUrl, { kind: 'detail' });
+        const html = response.body;
+        const record = buildRecord({
+            listing: { title: null, job_reference: getJobReferenceFromUrl(startUrl) },
+            detailUrl: startUrl,
+            html,
+        });
+        if (record) await Actor.pushData([record]);
+        log.info(`Done | saved=${record ? 1 : 0} | source=detail-url`);
+        return;
+    }
+
+    const candidates = buildSearchCandidates({ startUrl, keyword, location, domain });
+    let referer;
+    try {
+        referer = new URL(candidates[0]).origin;
+    } catch {
+        referer = `https://${domain}`;
+    }
+
+    let mode = 'market';
+    if (startUrl) mode = 'url';
+    else if (keyword && location) mode = 'keyword+location';
+    else if (keyword) mode = 'keyword';
+    log.info(
+        `Start run | market=${new URL(candidates[0]).host} | mode=${mode} | limit=${resultsWanted} | pages=${maxPages} | pool=${fetcher.size} | concurrency=${maxConcurrency} | details=${includeJobDetails}`,
+    );
+
+    const collected = await collectJobs({
+        fetcher,
+        candidates,
+        referer,
+        maxPages,
+        resultsWanted,
+    });
+
+    if (!collected.jobs.length) {
+        if (collected.noResults) {
+            log.warning('The search returned no jobs. Nothing to save.');
+            return;
+        }
+        throw new Error(`No job listings could be read (${collected.reason}). See API_DISCOVERY.md for the failure playbook.`);
+    }
+
+    const targets = collected.jobs.slice(0, resultsWanted);
+    log.info(`Found ${collected.jobs.length} unique jobs over ${collected.pages} page(s). Enriching ${includeJobDetails ? targets.length : 0}.`);
+
+    let saved = 0;
+    let detailFailures = 0;
+    let buffer = [];
+
+    const flush = async () => {
+        if (!buffer.length) return;
+        await Actor.pushData(buffer);
+        saved += buffer.length;
+        log.info(`Saved ${buffer.length} jobs. Total: ${saved}/${targets.length}`);
+        buffer = [];
+    };
+
+    if (!includeJobDetails) {
+        for (const job of targets) {
+            const record = buildRecord({ listing: job, detailUrl: job.url, html: null });
+            if (record) buffer.push(record);
+            if (buffer.length >= PUSH_BATCH_SIZE) await flush();
+        }
+        await flush();
+        log.info(`Done | saved=${saved} | pages=${collected.pages} | details=skipped`);
+        return;
+    }
+
+    const failedJobs = [];
+
+    for (let index = 0; index < targets.length; index += maxConcurrency) {
+        const chunk = targets.slice(index, index + maxConcurrency);
+        const settled = await Promise.allSettled(
+            chunk.map(async (job) => {
+                const response = await fetcher.fetchHtml(job.url, { kind: 'detail', referer: job.referer });
+                return buildRecord({ listing: job, detailUrl: job.url, html: response.body });
+            }),
+        );
+
+        for (let offset = 0; offset < settled.length; offset += 1) {
+            const result = settled[offset];
+            const job = chunk[offset];
+            if (result.status === 'fulfilled' && result.value) {
+                buffer.push(result.value);
+                continue;
+            }
+            failedJobs.push(job);
+            const reason = result.status === 'rejected' ? result.reason?.message : 'empty record';
+            log.warning(`Detail attempt failed for ${job.key} (${reason}); queued for a second pass.`);
+        }
+
+        if (buffer.length >= PUSH_BATCH_SIZE) await flush();
+    }
+
+    if (failedJobs.length) {
+        log.warning(`${failedJobs.length} detail page(s) failed; retrying with lower concurrency and fresh sessions.`);
+        await fetcher.rotateAll();
+        for (let index = 0; index < failedJobs.length; index += SECOND_PASS_CONCURRENCY) {
+            const chunk = failedJobs.slice(index, index + SECOND_PASS_CONCURRENCY);
+            const settled = await Promise.allSettled(
+                chunk.map(async (job) => {
+                    const response = await fetcher.fetchHtml(job.url, { kind: 'detail', referer: job.referer });
+                    return buildRecord({ listing: job, detailUrl: job.url, html: response.body });
+                }),
+            );
+
+            for (let offset = 0; offset < settled.length; offset += 1) {
+                const result = settled[offset];
+                const job = chunk[offset];
+                if (result.status === 'fulfilled' && result.value) {
+                    buffer.push(result.value);
+                    continue;
+                }
+                detailFailures += 1;
+                const reason = result.status === 'rejected' ? result.reason?.message : 'empty record';
+                log.warning(`Detail still unavailable for ${job.key} (${reason}); saving listing fields.`);
+                const fallback = buildRecord({ listing: job, detailUrl: job.url, html: null });
+                if (fallback) buffer.push(fallback);
+            }
+            await flush();
+        }
+    }
+
+    await flush();
+
+    const finalSlot = fetcher.slots[0];
+    log.info(
+        `Done | saved=${saved} | pages=${collected.pages} | stop=${collected.reason} | detail_failures=${detailFailures} | pool=${fetcher.size} | profile=${finalSlot?.profile || 'n/a'} | pacing_ms=${finalSlot?.pacingMs || 0}`,
+    );
+};
+
+await Actor.init();
+
 try {
     await main();
-} catch (err) {
-    log.error(`Fatal: ${err?.message || err}`);
-} finally {
     await Actor.exit();
+} catch (error) {
+    log.error(`Actor failed: ${error?.message || error}`);
+    await Actor.fail(error?.message || 'Actor failed');
 }

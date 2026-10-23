@@ -1,80 +1,105 @@
-# Michael Page Jobs Scraper
+## What does Michael Page Jobs Scraper do?
 
-Extract job listings from Michael Page at scale with fast pagination and rich detail extraction. Collect titles, locations, salaries, full job descriptions, and structured job metadata for analysis and monitoring.
+Michael Page Jobs Scraper collects live job listings from Michael Page market sites and returns structured records with titles, locations, salaries, contract types, sectors, full descriptions, and application links. Search by keyword and location, start from a prepared search URL, or choose one of 21 country sites. The result is a clean dataset ready for hiring research, salary checks, and job alert workflows.
 
-## Features
+## Why use Michael Page Jobs Scraper?
 
-- **Targeted job search** — Filter by keyword and location for precise collection
-- **Configurable volume** — Control total jobs with `results_wanted` and crawl scope with `max_pages`
-- **Rich detail extraction** — Opens job pages to capture `description_html`, `description_text`, and structured fields
-- **Incremental batched saving** — Pushes dataset items in batches during the run
-- **Clean output format** — Null and undefined values are removed before data is saved
-- **Automation-ready data** — Export to JSON, CSV, Excel, or connect to downstream tools
+- **One dataset for 21 markets** - Search the United States, United Kingdom, France, Germany, and 17 other Michael Page markets without changing tools.
+- **Full job detail** - Each record can include the complete description, salary range, sector, sub sector, consultant name, and job reference.
+- **Search control** - Use a keyword, a location, a prepared search URL, or a whole market. The Actor follows the mode you choose.
+- **Reliable collection** - Requests are paced and retried, so a short block does not end the run.
+- **Partial progress is kept** - Results are saved in batches as the run proceeds.
+- **Automation ready** - Export to JSON, CSV, Excel, or XML, or send results to Sheets, webhooks, Make, or Zapier.
 
-## Use Cases
+## What data can you extract from Michael Page?
 
-### Recruitment Intelligence
-Track open roles across regions and functions to identify hiring demand. Build talent market snapshots with location, compensation, and role-level signals.
+| Field | Description |
+|-------|-------------|
+| `title` | Job title |
+| `company` | Hiring organization |
+| `location` | Job location, including region and country when published |
+| `salary` | Salary text from the listing, for example `USD90,000 - USD140,000 per year` |
+| `base_salary` | Structured salary with currency, minimum, maximum, and pay period |
+| `job_type` | Contract type such as Permanent, CDI, or Festanstellung |
+| `job_nature` | Work arrangement when the market publishes it, such as Home Office |
+| `company_type` | Company type when the market publishes it |
+| `sector` | Michael Page sector |
+| `sub_sector` | Michael Page sub sector |
+| `industry` | Industry label from the job record |
+| `date_posted` | Posting date |
+| `description_html` | Full description as HTML |
+| `description_text` | Full description as plain text |
+| `summary` | Short summary from the search result |
+| `bullet_points` | Highlight bullets from the search result |
+| `consultant` | Consultant name when published |
+| `job_reference` | Michael Page job reference, for example `JN-102026-7132007` |
+| `url` | Direct job page |
+| `apply_url` | Direct application link |
+| `employment_type` | Structured employment type, for example `FULL_TIME` |
+| `job_location` | Structured location object |
+| `hiring_organization` | Structured company object |
+| `source_domain` | Market site that supplied the record |
+| `scrapedAt` | Collection timestamp |
 
-### Salary and Role Benchmarking
-Collect compensation and job type data to compare hiring packages across markets. Support planning with current role requirements and demand trends.
+## How to use Michael Page Jobs Scraper
 
-### Competitive Hiring Monitoring
-Monitor postings from target business areas to detect expansion patterns. Spot new hiring waves and strategic role openings quickly.
-
-### Workforce and Economic Research
-Build repeatable datasets for labor market studies and internal analytics. Analyze changes in role demand, skill mentions, and geography over time.
-
-### Lead and Opportunity Discovery
-Find relevant openings for staffing, consulting, and business development workflows. Route fresh job data into CRM, outreach, or alerting pipelines.
-
----
+1. Open the Actor on Apify Store.
+2. Enter a keyword, a location, or a prepared Michael Page search URL.
+3. Choose a country site if you do not want the United States.
+4. Set the result limit and page cap.
+5. Run the Actor and download the dataset or connect it to a workflow.
 
 ## Input Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `startUrl` | String | No | — | Start from a specific Michael Page search URL |
-| `keyword` | String | No | `""` | Search keyword, for example `project manager` |
-| `location` | String | No | `""` | Location filter, for example `New York` |
+| `startUrl` | String | No | - | A Michael Page search URL. Takes precedence over keyword, location, and market |
+| `keyword` | String | No | `project manager` | Search term such as `data analyst` or `operations manager` |
+| `location` | String | No | - | City, region, or postal code used to narrow the search |
+| `domain` | String | No | `www.michaelpage.com` | Country site to search |
 | `results_wanted` | Integer | No | `20` | Maximum number of jobs to save |
-| `max_pages` | Integer | No | `10` | Maximum listing pages to process |
-| `proxyConfiguration` | Object | No | Apify Residential | Proxy settings for reliable collection |
+| `max_pages` | Integer | No | `10` | Maximum number of search pages to read |
+| `maxConcurrency` | Integer | No | `10` | Parallel job-detail requests, from 1 to 20 |
+| `includeJobDetails` | Boolean | No | `true` | Read each job page for the full description and extra fields |
+| `proxyConfiguration` | Object | No | Apify datacenter | Apify datacenter proxy, residential proxy, custom proxies, or no proxy |
 
----
+### Supported country sites
+
+United States, United Kingdom, France, Germany, Spain, Italy, Netherlands, Switzerland, Belgium, Austria, Ireland, Portugal, United Arab Emirates, Australia, Canada, Singapore, Hong Kong, China, Japan, Mexico, and Brazil.
 
 ## Output Data
 
-Each dataset item omits fields with `null` or `undefined` values.
+Each item keeps the source field names. Empty values are omitted.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `title` | String | Job title |
-| `company` | String | Hiring organization name |
+| `company` | String | Hiring organization |
 | `location` | String | Job location |
-| `salary` | String | Salary text or range |
-| `job_type` | String | Employment type label |
-| `industry` | String | Industry category |
+| `salary` | String | Salary text |
+| `job_type` | String | Contract type |
+| `sector` | String | Sector |
+| `sub_sector` | String | Sub sector |
+| `industry` | String | Industry |
 | `date_posted` | String | Posting date |
-| `description_html` | String | Full description in HTML |
-| `description_text` | String | Plain text description |
-| `url` | String | Direct job URL |
-| `scrapedAt` | String | Extraction timestamp |
-| `listing_job_id` | String | Listing-level job identifier |
-| `job_id` | String | Identifier from job metadata |
-| `employment_type` | String/Array | Employment type from structured data |
-| `base_salary` | Object/String | Structured salary information |
-| `hiring_organization` | Object | Structured company details |
-| `summary` | String | Listing summary text |
-| `bullet_points` | Array | Listing bullet points |
-
----
+| `description_html` | String | Description HTML |
+| `description_text` | String | Description text |
+| `url` | String | Job page URL |
+| `apply_url` | String | Application URL |
+| `job_reference` | String | Michael Page reference |
+| `consultant` | String | Consultant name |
+| `base_salary` | Object | Structured salary |
+| `job_location` | Object | Structured location |
+| `summary` | String | Search result summary |
+| `bullet_points` | Array | Search result highlights |
+| `source_domain` | String | Market site |
+| `scrapedAt` | String | Collection timestamp |
 
 ## Usage Examples
 
-### Basic Job Search
+### Basic keyword search
 
-Collect 50 project manager jobs:
+Collect 50 project manager jobs from the United States:
 
 ```json
 {
@@ -83,135 +108,149 @@ Collect 50 project manager jobs:
 }
 ```
 
-### Keyword + Location Search
+### Keyword and location
 
-Collect software engineering jobs in New York:
+Collect finance jobs in Texas:
 
 ```json
 {
-  "keyword": "software engineer",
-  "location": "New York",
-  "results_wanted": 100,
-  "max_pages": 20
+  "keyword": "finance manager",
+  "location": "Texas",
+  "results_wanted": 40,
+  "max_pages": 3
 }
 ```
 
-### Start From a Custom Search URL
+### Search a different market
 
-Use a prepared Michael Page search page:
+Collect operations manager jobs from the United Kingdom:
+
+```json
+{
+  "keyword": "operations manager",
+  "domain": "www.michaelpage.co.uk",
+  "results_wanted": 60,
+  "max_pages": 4
+}
+```
+
+### Start from a prepared search URL
+
+Use a saved Michael Page search page:
 
 ```json
 {
   "startUrl": "https://www.michaelpage.com/jobs?search=data+analyst&location=California",
-  "results_wanted": 75
+  "results_wanted": 75,
+  "max_pages": 5
 }
 ```
-
----
 
 ## Sample Output
 
 ```json
 {
-  "title": "Quality Manager - USDA Food Manufacturer",
+  "title": "Project Manager",
   "company": "Michael Page",
-  "location": "Vernon, California",
-  "salary": "USD110,000 - USD140,000 per year",
+  "location": "Branford, Connecticut, US",
+  "salary": "USD90,000 - USD140,000 per year",
   "job_type": "Permanent",
-  "industry": "Engineering & Manufacturing",
-  "date_posted": "2026-02-17",
-  "description_html": "<p>...</p>",
-  "description_text": "Potential for Growth and Advancement ...",
-  "summary": "The Quality Manager will oversee quality assurance processes ...",
+  "sector": "Construction",
+  "sub_sector": "Project Manager",
+  "industry": "Construction",
+  "date_posted": "2026-10-22",
+  "description_html": "<p>Manage multiple civil and sitework construction projects from preconstruction through closeout.</p>",
+  "description_text": "Manage multiple civil and sitework construction projects from preconstruction through closeout.",
+  "url": "https://www.michaelpage.com/job-detail/project-manager/ref/jn-102026-7132007",
+  "apply_url": "https://www.michaelpage.com/job-apply/project-manager/ref/jn-102026-7132007",
+  "job_reference": "JN-102026-7132007",
+  "consultant": "Rick Mancini",
+  "base_salary": {
+    "currency": "USD",
+    "unitText": "YEAR",
+    "minValue": "90000",
+    "maxValue": "140000"
+  },
+  "employment_type": "FULL_TIME",
+  "summary": "This is an excellent opportunity for a construction professional looking to manage multiple high-impact projects.",
   "bullet_points": [
-    "Potential for Growth and Advancement",
-    "Fast Paced, Exciting Work Environment"
+    "Growth Potential",
+    "Excellent backlog of work"
   ],
-  "url": "https://www.michaelpage.com/job-detail/quality-manager/ref/jn-022026-6950214",
-  "scrapedAt": "2026-02-18T07:20:59.304Z",
-  "listing_job_id": "6130071",
-  "employment_type": "FULL_TIME"
+  "source_domain": "www.michaelpage.com",
+  "scrapedAt": "2026-10-22T15:55:00.000Z"
 }
 ```
 
----
-
 ## Tips for Best Results
 
-### Start Small, Then Scale
-- Begin with `results_wanted` between 20 and 50 during setup
-- Increase volume after validating your target query patterns
-- Use focused keywords to improve relevance
+- Start with 20 to 50 results to confirm the search before scaling up.
+- Use specific role names instead of broad terms to improve relevance.
+- Keep `max_pages` aligned with the number of results you want. Most markets show 30 jobs per page; France and China show 20.
+- Leave the country site on United States unless you need local listings from another market.
+- If a market publishes no salary, the salary fields stay empty. That reflects the source page, not a failed run.
+- Schedule repeat runs to track new openings and removed roles.
+- For a fast listing-only run, set `includeJobDetails` to false. You get titles, locations, salaries, contract types, summaries, and job links without opening each job page.
+- For large detail runs, use a proxy and raise `maxConcurrency` to 12 or 16. The Actor opens several proxy sessions and fetches listing pages in parallel.
 
-### Improve Result Quality
-- Combine `keyword` and `location` for cleaner matching
-- Use specific role names instead of broad terms when possible
+### Proxy guidance
 
-### Keep Runs Reliable
-- Keep `max_pages` aligned with realistic result volume
-- Use proxy configuration for stable large runs
-- Schedule periodic runs to monitor fresh openings
+Apify datacenter proxy is enabled by default. It avoids the site throttling that direct requests receive and keeps large runs fast.
 
----
+In a 200-job test, datacenter with 16 concurrency finished in 46 seconds. With the default settings, the same run finished in 57 to 90 seconds. Residential finished in about one minute. No proxy took 4 to 7 minutes.
+
+The Actor pins Apify Proxy to the market country automatically when you do not set one. For example, `www.michaelpage.com` uses US proxies and `www.michaelpage.co.uk` uses GB proxies.
+
+- Datacenter proxy: the default. Recommended for large or repeated detail runs.
+- Residential proxy: works and uses residential bandwidth. Use it when datacenter proxies are blocked or when you need a different network identity.
+- No proxy: clear the proxy configuration for small or occasional runs, or when `includeJobDetails` is false.
 
 ## Integrations
 
-Connect output data with:
-
-- **Google Sheets** — Build shared tracking and reporting views
-- **Airtable** — Create searchable recruitment datasets
-- **Slack** — Send run notifications and job alerts
-- **Webhooks** — Push records to custom APIs and services
-- **Make** — Automate data routing workflows
-- **Zapier** — Trigger actions from new dataset items
-
-### Export Formats
-
-- **JSON** — API and engineering workflows
-- **CSV** — Spreadsheet analysis
-- **Excel** — Business reporting
-- **XML** — Legacy and system integrations
-
----
+- **Google Sheets** - Build shared hiring trackers and salary tables.
+- **Webhooks** - Send new roles to an internal job board or alerting service.
+- **Make or Zapier** - Route records to CRM, ATS, or messaging tools.
+- **Apify API** - Pull datasets into your own applications and dashboards.
+- **CSV, Excel, JSON, XML** - Download results in the format your team uses.
 
 ## Frequently Asked Questions
 
-### How many jobs can I collect?
-Set `results_wanted` to your target count. Actual output depends on available listings for your query.
+### Can I scrape jobs from more than one country?
 
-### Does it support pagination?
-Yes. The actor automatically continues through results pages until limits are reached.
+Yes. Choose a country site from the `domain` field. The Actor supports 21 Michael Page markets.
 
-### Why are some fields missing in an item?
-Fields with `null` or `undefined` values are omitted. If a source value is not provided, that field will not appear in the item.
+### Can I search by city or region?
 
-### Can I run location-specific searches?
-Yes. Use the `location` input or pass a pre-filtered `startUrl`.
+Yes. Add a value to `location`, for example `New York`, `Texas`, or `London`.
 
-### Does it open each job detail page?
-Yes. It visits detail pages to enrich each result with full description and additional structured metadata.
+### Does the Actor open each job page?
 
-### Can I schedule recurring runs?
-Yes. Use Apify schedules to run daily, weekly, or on custom intervals.
+Yes. It reads the search results first, then collects the full description and structured details from each job page.
 
-### Where can I use the output?
-You can export directly or connect to analytics, ATS, CRM, or automation tools.
+### Why is a salary field missing?
 
----
+Some employers do not publish a salary. In that case the salary fields are omitted for that job.
+
+### Can I export the dataset to CSV or Excel?
+
+Yes. Apify datasets can be downloaded as CSV, Excel, JSON, XML, and other supported formats.
+
+### Can I schedule the Actor?
+
+Yes. Use Apify Schedules to run it hourly, daily, weekly, or at another interval.
+
+### What happens if a job page cannot be opened?
+
+The run keeps the search result fields for that job and continues with the rest. A warning appears in the run log.
+
+### Can I use a prepared Michael Page URL?
+
+Yes. Put the search URL in `startUrl`. It overrides the keyword, location, and market fields.
 
 ## Support
 
-For issues or feature requests, use support channels in the Apify Console.
-
-### Resources
-
-- [Apify Documentation](https://docs.apify.com/)
-- [Apify API Reference](https://docs.apify.com/api/v2)
-- [Apify Schedules](https://docs.apify.com/platform/schedules)
-- [Apify Integrations](https://docs.apify.com/platform/integrations)
-
----
+For issues or feature requests, use the Issues tab on the Actor page or contact the developer through Apify.
 
 ## Legal Notice
 
-This actor is intended for legitimate data collection use cases. You are responsible for compliance with applicable laws and the target website terms. Use data responsibly.
+This Actor collects data from publicly available Michael Page job pages. Users are responsible for complying with applicable laws, website terms, and privacy rules, and for using the data responsibly.

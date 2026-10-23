@@ -1,53 +1,121 @@
 {
   "title": "Michael Page Jobs Scraper",
-  "description": "Scrape job listings from Michael Page with fast pagination and rich job-detail extraction, including full descriptions and structured fields.",
+  "description": "Collect Michael Page job listings with full descriptions, salary details, sector data, and structured job metadata.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Start scraping from a specific Michael Page search URL. If provided, this overrides keyword and location.",
+      "description": "A Michael Page search URL. When supplied, it takes precedence over the keyword, location, and market fields.",
       "editor": "textfield"
     },
     "keyword": {
       "title": "Keyword",
       "type": "string",
-      "description": "Job search keyword(s), e.g., 'Software Engineer', 'Project Manager', 'Data Analyst'.",
+      "description": "Job search term, for example 'project manager' or 'data analyst'.",
       "editor": "textfield",
-      "prefill": "project manager"
+      "prefill": "project manager",
+      "default": "project manager"
     },
     "location": {
       "title": "Location",
       "type": "string",
-      "description": "Location filter for Michael Page jobs, e.g., 'New York', 'London'.",
+      "description": "Optional city, region, or postal code used to narrow the search, for example 'New York'.",
       "editor": "textfield"
     },
+    "domain": {
+      "title": "Country site",
+      "type": "string",
+      "description": "Michael Page market to search. Each market returns its own local listings.",
+      "editor": "select",
+      "default": "www.michaelpage.com",
+      "enum": [
+        "www.michaelpage.com",
+        "www.michaelpage.co.uk",
+        "www.michaelpage.fr",
+        "www.michaelpage.de",
+        "www.michaelpage.es",
+        "www.michaelpage.it",
+        "www.michaelpage.nl",
+        "www.michaelpage.ch",
+        "www.michaelpage.be",
+        "www.michaelpage.at",
+        "www.michaelpage.ie",
+        "www.michaelpage.pt",
+        "www.michaelpage.ae",
+        "www.michaelpage.com.au",
+        "www.michaelpage.ca",
+        "www.michaelpage.com.sg",
+        "www.michaelpage.com.hk",
+        "www.michaelpage.com.cn",
+        "www.michaelpage.co.jp",
+        "www.michaelpage.com.mx",
+        "www.michaelpage.com.br"
+      ],
+      "enumTitles": [
+        "United States",
+        "United Kingdom",
+        "France",
+        "Germany",
+        "Spain",
+        "Italy",
+        "Netherlands",
+        "Switzerland",
+        "Belgium",
+        "Austria",
+        "Ireland",
+        "Portugal",
+        "United Arab Emirates",
+        "Australia",
+        "Canada",
+        "Singapore",
+        "Hong Kong",
+        "China",
+        "Japan",
+        "Mexico",
+        "Brazil"
+      ]
+    },
     "results_wanted": {
-      "title": "Maximum number of jobs",
+      "title": "Maximum jobs",
       "type": "integer",
-      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
+      "description": "Maximum number of jobs to save.",
       "minimum": 1,
       "default": 20,
-      "prefill": 20,
       "editor": "number"
     },
     "max_pages": {
-      "title": "Maximum number of pages",
+      "title": "Maximum pages",
       "type": "integer",
-      "description": "A safety cap on the number of search result pages to visit.",
+      "description": "Safety cap on the number of search result pages to read.",
       "minimum": 1,
-      "editor": "number",
       "default": 10,
-      "prefill": 10
+      "editor": "number"
+    },
+    "maxConcurrency": {
+      "title": "Detail concurrency",
+      "type": "integer",
+      "description": "Parallel job-detail requests. Higher values finish faster with a proxy; lower values are safer without one. Try 12 to 16 for large proxy runs.",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 10,
+      "editor": "number"
+    },
+    "includeJobDetails": {
+      "title": "Include job details",
+      "type": "boolean",
+      "description": "Read each job page for the full description, consultant, and reference. Turn off for a faster listing-only run.",
+      "default": true,
+      "editor": "checkbox"
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Proxy for reliable scraping. Residential proxies recommended.",
+      "description": "Apify datacenter proxy is used by default. Clear it to connect directly, or add custom proxy URLs.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": false
+        "useApifyProxy": true
       }
     }
   },

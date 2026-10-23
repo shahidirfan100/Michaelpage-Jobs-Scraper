@@ -13,9 +13,12 @@
           "job_type",
           "job_nature",
           "sector",
+          "sub_sector",
           "industry",
           "date_posted",
-          "url"
+          "job_reference",
+          "url",
+          "apply_url"
         ]
       },
       "display": {
@@ -49,6 +52,10 @@
             "label": "Sector",
             "format": "text"
           },
+          "sub_sector": {
+            "label": "Sub Sector",
+            "format": "text"
+          },
           "industry": {
             "label": "Industry",
             "format": "text"
@@ -57,8 +64,16 @@
             "label": "Posted",
             "format": "text"
           },
+          "job_reference": {
+            "label": "Reference",
+            "format": "text"
+          },
           "url": {
             "label": "URL",
+            "format": "link"
+          },
+          "apply_url": {
+            "label": "Apply URL",
             "format": "link"
           }
         }
