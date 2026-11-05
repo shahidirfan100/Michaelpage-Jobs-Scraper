@@ -51,16 +51,17 @@ const MARKET_COUNTRIES = {
 
 const DEFAULT_DOMAIN = 'www.michaelpage.com';
 const PROFILE_POOL = ['chrome151', 'chrome142', 'firefox144', 'ios18', 'okhttp5'];
-const MAX_ATTEMPTS = 4;
+const MAX_ATTEMPTS = 5;
 const MAX_REDIRECTS = 5;
 const MAX_PAGES_HARD_LIMIT = 200;
 const REQUEST_TIMEOUT_MS = 45000;
-const BASE_RETRY_DELAY_MS = 900;
-const MAX_RETRY_DELAY_MS = 15000;
-const PACE_MIN_DIRECT_MS = 350;
-const PACE_MAX_DIRECT_MS = 2500;
-const PACE_MIN_PROXY_MS = 180;
-const PACE_MAX_PROXY_MS = 1500;
+const BASE_RETRY_DELAY_MS = 2000;
+const MAX_RETRY_DELAY_MS = 30000;
+const RECOVERY_COOLDOWN_MS = 30000;
+const PACE_MIN_DIRECT_MS = 900;
+const PACE_MAX_DIRECT_MS = 6000;
+const PACE_MIN_PROXY_MS = 500;
+const PACE_MAX_PROXY_MS = 4000;
 const PROXY_POOL_MAX = 8;
 const DEFAULT_DETAIL_CONCURRENCY = 6;
 const MAX_DETAIL_CONCURRENCY = 20;
@@ -88,6 +89,10 @@ const sleep = (ms) => new Promise((resolve) => {
 });
 
 const normalizeText = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const briefError = (error) => String(error?.message || error || 'unknown error')
+    .replace(/\s+/g, ' ')
+    .slice(0, 160);
 
 const normalizePositiveInt = (value, fallback) => {
     const number = Number(value);
@@ -178,6 +183,13 @@ const isClosedOffice = (body) => /CLOUDFLARE_ERROR_1000S_BOX|our office .{0,120}
 
 const isRetryableStatus = (status) => status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
 
+const isTransientError = (error) => {
+    if (!error?.isHttpError) return true;
+    if (error.noResults || error.closed) return false;
+    const { status } = error;
+    return !status || status >= 500 || status === 403 || status === 408 || status === 425 || status === 429;
+};
+
 const visibleText = (html) => stripTags(
     String(html)
         .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -189,7 +201,7 @@ const isNoResultsHtml = (html) => {
     return /search returned no results|aucun r[eé]sultat|keine ergebnisse|nessun risultato|no hay resultados|geen resultaten|sem resultados|没有找到|検索結果がありません/i.test(text);
 };
 
-const looksLikeDetail = (html) => /JobPosting|job-apply-job-title|job_advert__job-desc-role/i.test(String(html).slice(0, 400000));
+const looksLikeDetail = (html) => /JobPosting|job-apply-job-title|job_advert__job-desc-role/i.test(String(html));
 
 const jobKeyFromUrl = (url) => {
     const reference = String(url).match(/\/ref\/([^/?#]+)/i)?.[1];
@@ -548,7 +560,7 @@ const buildRecord = ({ listing, detailUrl, html }) => {
             jobPosting = findJobPosting(parseJsonLdBlocks(html));
             extras = parseDetailHtml(html);
         } catch (error) {
-            log.warning(`Detail parsing fell back to listing fields for ${jobKeyFromUrl(detailUrl)}: ${error.message}`);
+            log.warning(`Detail parsing fell back to listing fields for ${jobKeyFromUrl(detailUrl)}: ${briefError(error)}`);
         }
     }
 
@@ -632,6 +644,7 @@ class RequestPool {
         this.slots = [];
         this.cursor = 0;
         this.profileCursor = 0;
+        this.rotationCounter = 0;
         this.runTag = Date.now().toString(36);
     }
 
@@ -640,19 +653,23 @@ class RequestPool {
             this.slots.push(await this.createSlot(index, 0, this.minPaceMs));
         }
         if (this.proxyConfiguration && this.slots.some((slot) => !slot.proxyUrl)) {
-            throw new Error('Apify Proxy session could not be created. Check proxy access and try again.');
+            log.warning('Apify Proxy could not be reached; continuing without a proxy.');
+            await this.useDirect();
         }
     }
 
     async createSlot(index, attempt, pacingMs) {
         const profile = PROFILE_POOL[this.profileCursor % PROFILE_POOL.length];
         this.profileCursor += 1;
+        this.rotationCounter += 1;
         let proxyUrl;
         if (this.proxyConfiguration) {
             try {
-                proxyUrl = await this.proxyConfiguration.newUrl(`mp_${this.runTag}_${index}_${attempt}`);
+                proxyUrl = await this.proxyConfiguration.newUrl(
+                    `mp_${this.runTag}_${index}_${attempt}_${this.rotationCounter}`,
+                );
             } catch (error) {
-                log.warning(`Proxy session could not be created: ${error.message}`);
+                log.warning(`Proxy session could not be created: ${briefError(error)}`);
             }
         }
         return {
@@ -678,10 +695,11 @@ class RequestPool {
     }
 
     async rotateSlot(slot) {
-        const next = await this.createSlot(slot.index, slot.attempt + 1, slot.pacingMs);
+        const current = this.slots[slot.index];
+        const next = await this.createSlot(slot.index, current.attempt + 1, current.pacingMs);
         if (this.proxyConfiguration && !next.proxyUrl) {
             log.warning('Proxy session rotation failed; keeping the current session.');
-            return slot;
+            return current;
         }
         this.slots[slot.index] = next;
         return next;
@@ -695,11 +713,37 @@ class RequestPool {
         }
     }
 
+    // Drop the proxy and collapse to one direct slot: direct IPs throttle, so parallel slots would hurt.
+    async useDirect() {
+        this.proxyConfiguration = null;
+        this.size = 1;
+        this.minPaceMs = PACE_MIN_DIRECT_MS;
+        this.maxPaceMs = PACE_MAX_DIRECT_MS;
+        this.slots = [await this.createSlot(0, 1, PACE_MIN_DIRECT_MS)];
+    }
+
+    async useProxyConfiguration(proxyConfiguration, size, minPaceMs, maxPaceMs) {
+        this.proxyConfiguration = proxyConfiguration;
+        this.size = Math.max(1, size);
+        this.minPaceMs = minPaceMs;
+        this.maxPaceMs = maxPaceMs;
+        this.slots = [];
+        for (let index = 0; index < this.size; index += 1) {
+            this.slots.push(await this.createSlot(index, 1, minPaceMs));
+        }
+        if (this.slots.some((slot) => !slot.proxyUrl)) {
+            log.warning('Default proxy pool could not be reached; continuing without a proxy.');
+            await this.useDirect();
+        }
+    }
+
+    // Stagger request starts using the latest slot state, not the caller's stale copy.
     async pace(slot) {
+        const current = this.slots[slot.index];
         const now = Date.now();
-        const at = Math.max(now, slot.nextSlotAt);
-        const nextSlotAt = at + slot.pacingMs + Math.floor(Math.random() * slot.pacingMs * 0.4);
-        const next = { ...slot, nextSlotAt };
+        const at = Math.max(now, current.nextSlotAt);
+        const nextSlotAt = at + current.pacingMs + Math.floor(Math.random() * current.pacingMs * 0.4);
+        const next = { ...current, nextSlotAt };
         this.slots[slot.index] = next;
         const wait = at - now;
         if (wait > 0) await sleep(wait);
@@ -707,17 +751,25 @@ class RequestPool {
     }
 
     setPacing(slot, pacingMs) {
-        const next = { ...slot, pacingMs };
+        const next = { ...this.slots[slot.index], pacingMs };
         this.slots[slot.index] = next;
         return next;
     }
 
     noteThrottle(slot) {
-        return this.setPacing(slot, Math.min(this.maxPaceMs, Math.round(slot.pacingMs * 1.7)));
+        return this.setPacing(slot, Math.min(this.maxPaceMs, Math.round(this.slots[slot.index].pacingMs * 1.7)));
     }
 
     noteSuccess(slot) {
-        return this.setPacing(slot, Math.max(this.minPaceMs, Math.round(slot.pacingMs * 0.9)));
+        return this.setPacing(slot, Math.max(this.minPaceMs, Math.round(this.slots[slot.index].pacingMs * 0.9)));
+    }
+
+    async cooldown(ms) {
+        const until = Date.now() + ms;
+        for (const slot of this.slots) {
+            slot.nextSlotAt = Math.max(slot.nextSlotAt, until);
+        }
+        await sleep(ms);
     }
 
     retryDelay(attempt, headers) {
@@ -852,10 +904,13 @@ class RequestPool {
                     pacingMs: slot.pacingMs,
                 };
             } catch (error) {
-                if (error.isHttpError && (error.noResults || error.closed)) throw error;
+                // A 404/410/400 will not heal on a retry; only transient failures are worth the attempts.
+                if (error.isHttpError && !isTransientError(error)) throw error;
                 lastError = error;
+                // A proxy auth rejection never reaches the site; stop retrying so the pool can be swapped.
+                if (/proxy authentication required/i.test(briefError(error))) break;
                 if (attempt >= MAX_ATTEMPTS) break;
-                log.warning(`Request failed (${error.message}); retrying.`);
+                log.warning(`Request failed (${briefError(error)}); retrying.`);
                 slot = this.noteThrottle(slot);
                 slot = await this.rotateSlot(slot);
                 await sleep(this.retryDelay(attempt));
@@ -951,6 +1006,7 @@ const hasNextPage = (html) => /rel=["']next["']/i.test(String(html));
 const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWanted }) => {
     let sawNoResults = false;
     let lastReason = 'not_attempted';
+    let lastTransient = false;
 
     const fetchPage = async (candidate, page) => {
         const pageUrl = withPage(candidate, page);
@@ -965,16 +1021,18 @@ const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWant
     for (const candidate of candidates) {
         const first = await fetchPage(candidate, 0);
         if (first.error) {
+            lastTransient = isTransientError(first.error);
             if (first.error.noResults) {
                 sawNoResults = true;
                 lastReason = 'no_results';
                 continue;
             }
-            lastReason = first.error.message;
+            lastReason = briefError(first.error);
             continue;
         }
         const firstJobs = extractListingJobs(first.html, first.pageUrl);
         if (!firstJobs.length) {
+            lastTransient = false;
             if (isNoResultsHtml(first.html)) sawNoResults = true;
             lastReason = sawNoResults ? 'no_results' : 'no_job_rows';
             continue;
@@ -994,8 +1052,10 @@ const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWant
             const settled = await Promise.all(requests);
             pageResults.push(...settled);
         } else {
+            let pageErrors = 0;
             for (let page = 1; page < pagesToTry; page += 1) {
-                if (!hasNextPage(pageResults[pageResults.length - 1].html)) {
+                const lastGood = pageResults.filter((entry) => !entry.error).at(-1);
+                if (!lastGood || !hasNextPage(lastGood.html)) {
                     stopReason = 'last_page';
                     break;
                 }
@@ -1007,10 +1067,17 @@ const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWant
                         stopReason = 'no_results';
                         break;
                     }
-                    log.warning(`Listing page ${page + 1} failed (${result.error.message}); stopping pagination.`);
-                    stopReason = 'page_error';
-                    break;
+                    lastTransient = isTransientError(result.error);
+                    pageErrors += 1;
+                    log.warning(`Listing page ${page + 1} failed (${briefError(result.error)}); skipping it.`);
+                    // Skip a flaky page, but stop after two in a row so an outage does not burn every page.
+                    if (pageErrors >= 2) {
+                        stopReason = 'page_error';
+                        break;
+                    }
+                    continue;
                 }
+                pageErrors = 0;
                 if (!extractListingJobs(result.html, result.pageUrl).length) {
                     stopReason = 'no_job_rows';
                     break;
@@ -1024,6 +1091,7 @@ const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWant
 
         for (const result of pageResults) {
             if (result.error) {
+                lastTransient = isTransientError(result.error);
                 if (result.error.noResults) sawNoResults = true;
                 continue;
             }
@@ -1045,7 +1113,7 @@ const collectJobs = async ({ fetcher, candidates, referer, maxPages, resultsWant
         lastReason = sawNoResults ? 'no_results' : stopReason;
     }
 
-    return { jobs: [], pages: 0, reason: lastReason, noResults: sawNoResults };
+    return { jobs: [], pages: 0, reason: lastReason, noResults: sawNoResults, transient: lastTransient };
 };
 
 const createProxyConfiguration = async (proxyInput) => {
@@ -1056,7 +1124,7 @@ const createProxyConfiguration = async (proxyInput) => {
     try {
         return await Actor.createProxyConfiguration(proxyInput);
     } catch (error) {
-        log.warning(`Proxy configuration could not be created: ${error.message}. Continuing without a proxy.`);
+        log.warning(`Proxy configuration could not be created: ${briefError(error)}. Continuing without a proxy.`);
         return undefined;
     }
 };
@@ -1076,11 +1144,15 @@ const main = async () => {
     );
     const includeJobDetails = input.includeJobDetails !== false;
     const proxyInput = { ...(input.proxyConfiguration || {}) };
-    if (proxyInput.useApifyProxy && !proxyInput.apifyProxyCountry) {
-        const country = getMarketCountry(startUrl || domain);
-        if (country) proxyInput.apifyProxyCountry = country;
-    }
+    const autoPinnedCountry = proxyInput.useApifyProxy && !proxyInput.apifyProxyCountry
+        ? getMarketCountry(startUrl || domain)
+        : null;
+    if (autoPinnedCountry) proxyInput.apifyProxyCountry = autoPinnedCountry;
     const proxyConfiguration = await createProxyConfiguration(proxyInput);
+    // Some accounts reject specific country pools; keep an unpinned fallback for the recovery pass.
+    const unpinnedProxyConfiguration = autoPinnedCountry
+        ? await createProxyConfiguration({ ...proxyInput, apifyProxyCountry: undefined })
+        : undefined;
     const poolSize = proxyConfiguration
         ? Math.max(1, Math.min(PROXY_POOL_MAX, Math.ceil(maxConcurrency / 2)))
         : 1;
@@ -1121,17 +1193,46 @@ const main = async () => {
         `Start run | market=${new URL(candidates[0]).host} | mode=${mode} | limit=${resultsWanted} | pages=${maxPages} | pool=${fetcher.size} | concurrency=${maxConcurrency} | details=${includeJobDetails}`,
     );
 
-    const collected = await collectJobs({
+    const runCollect = (list = candidates) => collectJobs({
         fetcher,
-        candidates,
+        candidates: list,
         referer,
         maxPages,
         resultsWanted,
     });
 
+    let collected = await runCollect();
+
+    // A 200 page with no tiles can still be a soft block, so retry once even when the error is not a 5xx.
+    if (!collected.jobs.length && !collected.noResults) {
+        const cooldown = collected.transient ? RECOVERY_COOLDOWN_MS : 5000;
+        log.warning(`No listings on the first pass (${collected.reason}); cooling down ${Math.round(cooldown / 1000)}s and retrying.`);
+        await fetcher.cooldown(cooldown);
+        await fetcher.rotateAll();
+        collected = await runCollect([...candidates].reverse());
+    }
+
+    // A country-pinned pool can be unavailable for some accounts while the default pool works.
+    if (!collected.jobs.length && !collected.noResults && collected.transient && unpinnedProxyConfiguration) {
+        log.warning(`Proxy pool for ${autoPinnedCountry} is failing; retrying with the default pool.`);
+        await fetcher.useProxyConfiguration(unpinnedProxyConfiguration, poolSize, PACE_MIN_PROXY_MS, PACE_MAX_PROXY_MS);
+        collected = await runCollect();
+    }
+
+    // Datacenter proxy IPs sometimes stay blocked while a direct connection still works.
+    if (!collected.jobs.length && !collected.noResults && collected.transient && proxyConfiguration) {
+        log.warning('Proxy endpoints are still blocked; retrying without a proxy.');
+        await fetcher.useDirect();
+        collected = await runCollect();
+    }
+
     if (!collected.jobs.length) {
         if (collected.noResults) {
             log.warning('The search returned no jobs. Nothing to save.');
+            return;
+        }
+        if (collected.transient) {
+            log.warning(`No job listings could be read (${collected.reason}) after recovery. Finishing without items.`);
             return;
         }
         throw new Error(`No job listings could be read (${collected.reason}). See API_DISCOVERY.md for the failure playbook.`);
@@ -1182,7 +1283,7 @@ const main = async () => {
                 continue;
             }
             failedJobs.push(job);
-            const reason = result.status === 'rejected' ? result.reason?.message : 'empty record';
+            const reason = result.status === 'rejected' ? briefError(result.reason) : 'empty record';
             log.warning(`Detail attempt failed for ${job.key} (${reason}); queued for a second pass.`);
         }
 
@@ -1209,7 +1310,7 @@ const main = async () => {
                     continue;
                 }
                 detailFailures += 1;
-                const reason = result.status === 'rejected' ? result.reason?.message : 'empty record';
+                const reason = result.status === 'rejected' ? briefError(result.reason) : 'empty record';
                 log.warning(`Detail still unavailable for ${job.key} (${reason}); saving listing fields.`);
                 const fallback = buildRecord({ listing: job, detailUrl: job.url, html: null });
                 if (fallback) buffer.push(fallback);
@@ -1232,6 +1333,6 @@ try {
     await main();
     await Actor.exit();
 } catch (error) {
-    log.error(`Actor failed: ${error?.message || error}`);
+    log.error(`Actor failed: ${briefError(error)}`);
     await Actor.fail(error?.message || 'Actor failed');
 }

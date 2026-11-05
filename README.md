@@ -7,8 +7,8 @@ Michael Page Jobs Scraper collects live job listings from Michael Page market si
 - **One dataset for 21 markets** - Search the United States, United Kingdom, France, Germany, and 17 other Michael Page markets without changing tools.
 - **Full job detail** - Each record can include the complete description, salary range, sector, sub sector, consultant name, and job reference.
 - **Search control** - Use a keyword, a location, a prepared search URL, or a whole market. The Actor follows the mode you choose.
-- **Reliable collection** - Requests are paced and retried, so a short block does not end the run.
-- **Partial progress is kept** - Results are saved in batches as the run proceeds.
+- **Reliable collection** - Requests are paced and retried. The Actor cools down and retries a blocked search, then falls back to a direct connection if the proxy stays blocked.
+- **Partial progress is kept** - Results are saved in batches as the run proceeds, and a site outage ends the run cleanly instead of failing it.
 - **Automation ready** - Export to JSON, CSV, Excel, or XML, or send results to Sheets, webhooks, Make, or Zapier.
 
 ## What data can you extract from Michael Page?

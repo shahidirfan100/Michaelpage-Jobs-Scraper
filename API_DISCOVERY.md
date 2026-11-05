@@ -209,4 +209,16 @@ When the actor starts failing, read this file first, then inspect the failing re
 5. **A market returns 403 with an office-closure message**: remove that market from the domain list; do not retry it.
 6. **Redirect loop**: the site may route a query to a path that redirects back. The redirect helper caps hops and stops on a repeated URL.
 
+## Resilience and recovery
+
+- Every request gets five attempts with exponential backoff (2 s to 30 s, jittered) and `Retry-After` support. Session pacing reads the current slot state, so concurrent requests queue instead of bursting.
+- Minimum pacing is 500 ms per proxy session and 900 ms on a direct connection. Successful requests speed up gradually; `403`, `429`, and `5xx` slow the session down.
+- When the first listing pass returns nothing and the failure looks transient, the actor pauses 30 s, rotates every session, and retries both search candidates.
+- If the automatically pinned country pool is rejected (for example HTTP 407 from the proxy), the retry loop stops early and the actor retries with the default Apify Proxy pool before changing anything else.
+- If the proxy is still blocked, the actor drops the proxy, collapses to one direct session, and retries once. Proxy creation failures also fall back to direct with a warning instead of ending the run.
+- Non-retryable responses such as `404` or `410` fail fast; only `403`, `408`, `425`, `429`, `5xx`, and network errors consume retry attempts.
+- A failed listing page no longer stops pagination. The page is skipped, and pagination stops only after two consecutive page failures.
+- A run that still cannot reach the site after recovery logs a warning and finishes successfully with zero items. A `200` page with no job rows (a real layout change) is still reported as an error.
+- Detail pages that still fail after the second pass are saved with listing fields, so one blocked job never ends the run.
+
 Any change to selectors, endpoints, or header handling must be reflected in this file.
